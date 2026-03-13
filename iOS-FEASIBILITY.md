@@ -248,7 +248,7 @@ cpxComxTnZtcn/b+mKDpYWLaC0Gv7UoiT8rpNqN3Vko645usz9OFc4VciijsHGRP
 XmmmoP6qykfI/vba8wIDAQAB
 ```
 
-The sif-patcher **does not** modify the RSA key — it only changes the domain. The RSA key must be replaced separately by binary-patching the `LoveLive` Mach-O executable (finding the old public key bytes with `strings` and replacing them). Pre-patched community clients already have this done.
+The sif-patcher **does not** modify the RSA key — it only changes the domain. The RSA key replacement is a separate binary-level modification to the `LoveLive` Mach-O executable. In practice, the community distributes **pre-patched client builds** (e.g., via Internet Archive) that already have the community-standard RSA key baked in. The sif-patcher web tool expects these pre-patched builds as input — it then only needs to swap the domain. So for end users, the workflow is: get the community-patched IPA → run it through sif-patcher with `http://127.0.0.1:51376` → sideload via AltStore.
 
 ### Can the Patcher Patch a Briefcase-Produced App?
 
