@@ -23,18 +23,44 @@ The Android self-contained experience uses:
 
 ---
 
+## iOS Platform: What Works and What Doesn't
+
+### CPython Official iOS Support (PEP 730)
+
+**iOS is an officially supported CPython platform since Python 3.13** (October 2024, [Tier 3](https://peps.python.org/pep-0730/)). This is a major enabler.
+
+Key constraints of CPython on iOS:
+- Python runs in **embedded mode only** — `libPython` must be linked into a native iOS app; you call `Py_Initialize()` from Swift/ObjC
+- **`fork()` and `spawn()` do not work** — `subprocess` and `multiprocessing` raise `PermissionError`. The server must run fully in-process (NPPS4's `android_main.py` already does this)
+- All `.so` binary modules must be converted into individually signed `.framework` bundles inside `Frameworks/` (Briefcase handles this automatically)
+- Embedding adds **~100 MB** to app size
+- Apple permits interpreted code only if **bundled with the app**, not downloaded at runtime
+
+### Prior Art: Pyto (App Store proof)
+
+[Pyto](https://github.com/ColdGrub1384/Pyto) is a full Python IDE on the App Store — **proof that Apple accepts embedded CPython**. It bundles Python via BeeWare's Python-Apple-support, includes NumPy/Pandas/scikit-learn as pre-compiled frameworks, and uses Rubicon-ObjC to bridge Python↔iOS APIs.
+
+---
+
 ## iOS Tooling Landscape (as of early 2026)
 
 ### BeeWare / Briefcase (Recommended)
 
-[BeeWare's Python-Apple-support](https://github.com/beeware/Python-Apple-support) provides pre-compiled CPython frameworks for iOS. [Briefcase](https://briefcase.beeware.org/en/v0.3.16/reference/platforms/iOS.html) is BeeWare's packaging tool that generates Xcode projects from Python apps.
+[BeeWare's Python-Apple-support](https://github.com/beeware/Python-Apple-support) provides pre-compiled `Python.xcframework` bundles for iOS. Available for Python 3.10 through 3.14 (latest builds: January 2026). [Briefcase](https://briefcase.beeware.org/en/v0.3.16/reference/platforms/iOS.html) generates Xcode projects from Python apps.
 
 Key milestones reached:
-- **pip 24.3** supports iOS platform tags per [PEP 730](https://peps.python.org/pep-0730/)
-- **PyPI now accepts iOS wheel uploads** (enabled in 2025)
-- **cibuildwheel** supports iOS builds
-- BeeWare has published [iOS wheels for the `cryptography` package](https://beeware.org/news/buzz/november-2025-status-update/) (Rust-based, using maturin)
-- [Mobile wheel tracking](https://beeware.org/mobile-wheels/) covers the top 360 binary packages
+- **CPython 3.13+**: iOS is Tier 3 supported per [PEP 730](https://peps.python.org/pep-0730/)
+- **pip 24.3**: Supports iOS platform tags
+- **PyPI**: Accepts iOS wheel uploads (enabled 2025)
+- **cibuildwheel**: Supports iOS builds
+- **iOS wheels for `cryptography`**: [Built by BeeWare](https://beeware.org/news/buzz/november-2025-status-update/) (Rust-based, via maturin)
+- **[Mobile wheel tracking](https://beeware.org/mobile-wheels/)**: Covers top 360 binary packages
+- **Debugger support**: PDB and VSCode debugging work on iOS (November 2025)
+
+Swift-Python bridge options:
+- **[PythonKit](https://github.com/pvieito/PythonKit)** — Swift framework that dynamically loads libPython, provides Pythonic Swift API (`let sys = Python.import("sys")`). Demonstrated working on iOS in the [BeeSwift project](https://github.com/radcli14/BeeSwift)
+- **[Rubicon-ObjC](https://rubicon-objc.readthedocs.io/)** — Bridge from Python side to ObjC/Swift APIs (used by Pyto)
+- **Direct C API** — Call `Py_Initialize()`, `PyRun_SimpleString()` etc. from Swift
 
 ### Kivy / python-for-ios (Alternative)
 
@@ -42,16 +68,35 @@ Key milestones reached:
 
 ### Maturin / PyO3 iOS support
 
-[Maturin v1.7.0 added initial iOS support](https://github.com/PyO3/maturin/issues/1742). Subsequent releases added PEP 730-compliant wheel naming and iOS cross-platform venv support. This means Rust-based Python packages (like pydantic-core) can theoretically be cross-compiled for iOS, though pydantic-core itself hasn't done this yet.
+[Maturin v1.7.0 added initial iOS support](https://github.com/PyO3/maturin/issues/1742). v1.10+ adds PEP 730-compliant wheel naming and iOS cross-platform venv support. Rust-based Python packages (like pydantic-core) can be cross-compiled for iOS using this toolchain.
 
 ### AltStore Distribution
 
 AltStore installs IPAs via sideloading. Key facts:
 - App must be a standard IPA file
-- Standard AltStore requires re-signing every 7 days (free developer account)
-- AltStore PAL (EU only under Digital Markets Act) allows permanent installs
-- TrollStore (specific iOS versions, e.g., 14.0-16.6.1) allows permanent installs without re-signing
+- **AltStore Classic** (worldwide): Re-signing every 7 days (free Apple ID), or 1 year ($99/yr developer account). Requires AltServer on Mac/PC as companion
+- **AltStore PAL** (EU/Japan, iOS 17.4+): Apple-notarized, no re-signing. Now free (was EUR 1.50/yr). Developers submit apps through AltStore PAL's process
+- **TrollStore** (iOS 14.0-16.6.1): Permanent install, no re-signing, no companion needed
 - No App Store review guidelines apply — embedded interpreters are fine
+
+AltStore sources use a [JSON format](https://faq.altstore.io/developers/make-a-source) for app distribution:
+```json
+{
+  "name": "NPPS4",
+  "identifier": "com.example.npps4",
+  "apiVersion": "v2",
+  "apps": [{
+    "name": "NPPS4 Server",
+    "bundleIdentifier": "com.example.npps4",
+    "versions": [{
+      "version": "1.0",
+      "downloadURL": "https://.../npps4.ipa",
+      "size": 12345678,
+      "minOSVersion": "16.0"
+    }]
+  }]
+}
+```
 
 ---
 
@@ -185,6 +230,7 @@ Pydantic v1 (1.10.x) will not support Python 3.14+, which is NPPS4's target runt
    - `setup_server()`, `start_server()`, `stop_server()`
    - Database import/export
    - Add `sys.platform == "ios"` handling in config.py, evloop.py, requirements
+   - **Critical**: iOS forbids `fork()`/`spawn()` — `subprocess` and `multiprocessing` raise `PermissionError`. The `android_main.py` pattern already avoids this (runs uvicorn in-process via `uvicorn.Server.run()`), so the same approach works. The `main.py` entrypoint (which uses `subprocess.call` for alembic/gunicorn) must NOT be used on iOS
 
 5. **Build native iOS UI** (~2-3 weeks)
    - Swift/SwiftUI wrapper app with:
@@ -193,7 +239,7 @@ Pydantic v1 (1.10.x) will not support Python 3.14+, which is NPPS4's target runt
      - Server URL display (for manual client configuration)
      - Database management (import/export/reset)
      - Configuration editor (server settings)
-   - Integrate with Python via PythonKit or direct C-level embedding
+   - Integrate with Python via [PythonKit](https://github.com/pvieito/PythonKit) (Pythonic Swift API) or direct C-level embedding (`Py_Initialize()` / `PyRun_SimpleString()`)
 
 ### Phase 3: Client Integration & Distribution (2-3 weeks)
 
@@ -205,7 +251,9 @@ Pydantic v1 (1.10.x) will not support Python 3.14+, which is NPPS4's target runt
    - Verify game functionality end-to-end
 
 7. **AltStore/TrollStore packaging** (~1 week)
-   - Build release IPA from Xcode project
+   - `briefcase open iOS` → Xcode, configure signing, Archive → `.ipa`
+   - Create AltStore source JSON (see format above)
+   - Host `.ipa` and source JSON
    - Test installation via AltStore
    - Test on TrollStore (if available)
    - Document the installation process
@@ -325,3 +373,8 @@ The pydantic-core cross-compilation is the only real unknown, but the tooling (m
 - [PyO3 iOS/Android cross-compilation discussion #4824](https://github.com/PyO3/pyo3/discussions/4824)
 - [Pydantic pure-Python fallback discussion #10859](https://github.com/pydantic/pydantic/discussions/10859)
 - [Python-Apple-support static linking requirement #56](https://github.com/beeware/Python-Apple-support/issues/56)
+- [CPython iOS usage docs](https://docs.python.org/3/using/ios.html)
+- [Pyto — Python IDE on App Store (proof of concept)](https://github.com/ColdGrub1384/Pyto)
+- [PythonKit — Swift-Python bridge](https://github.com/pvieito/PythonKit)
+- [AltStore source format docs](https://faq.altstore.io/developers/make-a-source)
+- [Python-Apple-support USAGE.md](https://github.com/beeware/Python-Apple-support/blob/main/USAGE.md)
