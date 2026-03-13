@@ -267,10 +267,13 @@ The obvious approach — a separate server IPA and client IPA communicating over
 
 #### SIF Game Engine: Playground OSS
 
-SIF uses [**Playground OSS**](https://github.com/nickyma/playground-win), KLab's custom open-source C/C++ game engine. This is relevant because:
-- It's **not Unity** — no IL2CPP/Mono complications when injecting native code
-- The engine is native C/C++ — a dylib injection via `LC_LOAD_DYLIB` is straightforward
-- The [SIF Win32 port](https://github.com/stlcours/SIF_Win32) confirms this engine structure
+SIF uses [**PlaygroundOSS**](https://github.com/KLab/PlaygroundOSS), KLab's own game engine (open-sourced under Apache License v2.0). This is relevant because:
+- It's **not Unity** — no IL2CPP/Mono complications when injecting native code. (Note: SIFAS/SIF2 used Unity, but the original SIF1 uses Playground)
+- The engine is native **C (67%) / C++ (27%)** with Objective-C for iOS — a dylib injection via `LC_LOAD_DYLIB` is straightforward
+- Uses a **standard `UIApplicationDelegate`** pattern (`Engine/porting/iOS/AppDelegate.mm`), meaning `__attribute__((constructor))` in an injected dylib fires cleanly before the engine's `application:didFinishLaunchingWithOptions:` runs
+- The engine uses **Lua** for game scripting and **OpenGL ES 2** for rendering
+- SIF has a significant startup sequence (launch splash → title screen → data download check) that provides **natural buffer time** for the Python server to initialize before the game makes its first network request
+- The [SIF Win32 port](https://github.com/stlcours/SIF_Win32) and [Playground-SIF fork](https://github.com/kotori2/Playground-SIF) confirm this engine structure
 
 #### How Dylib Injection Works
 
@@ -593,8 +596,9 @@ The critical path is:
 - [iPA-Edit — Cross-platform IPA modification tool](https://github.com/SHAJON-404/iPA-Edit)
 
 ### SIF Game Engine
-- [SIF Win32 port (confirms Playground OSS engine)](https://github.com/stlcours/SIF_Win32)
-- [Playground OSS — KLab's open-source game engine](https://github.com/nickyma/playground-win)
+- [PlaygroundOSS — KLab's open-source game engine (official repo)](https://github.com/KLab/PlaygroundOSS)
+- [SIF Win32 port (confirms PlaygroundOSS engine)](https://github.com/stlcours/SIF_Win32)
+- [Playground-SIF — All-platform SIF port using PlaygroundOSS](https://github.com/kotori2/Playground-SIF)
 
 ### Distribution
 - [AltStore source format docs](https://faq.altstore.io/developers/make-a-source)
