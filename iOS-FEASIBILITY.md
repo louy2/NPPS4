@@ -1,10 +1,13 @@
-# iOS Self-Contained Experience: Feasibility Analysis
+# iOS Self-Contained Experience: Feasibility Analysis (Embedded Python Route)
 
 ## Executive Summary
 
-Providing a self-contained NPPS4 experience on iOS (server + patched client on one device) is **significantly harder than on Android** but not impossible. The Android approach uses Chaquopy (Python embedded in a native Android app) which has no iOS equivalent. iOS alternatives exist but each involves substantial trade-offs in complexity, App Store compliance, and user experience.
+Providing a self-contained NPPS4 experience on iOS via AltStore is **feasible but requires meaningful dependency work**. The recommended path is BeeWare Briefcase with Python-Apple-support. The two binary dependencies (`pycryptodomex` and `pydantic-core`) are the critical blockers, but both have viable solutions:
 
-**Feasibility rating: Moderate-to-Hard. Estimated effort: 3-6 person-months** depending on the chosen approach.
+- **`pycryptodomex`**: Replace with `cryptography` (pyca), which already has [iOS wheels built by BeeWare](https://beeware.org/news/buzz/november-2025-status-update/). All crypto operations used by NPPS4 have direct equivalents.
+- **`pydantic-core`**: [Maturin gained iOS support in v1.7.0](https://github.com/PyO3/maturin/releases/tag/v1.7.0), but [pydantic-core has not yet published iOS wheels](https://github.com/pydantic/pydantic-core/issues/1170). The wheel must be built from source using maturin's iOS cross-compilation, which is now technically possible but untested for pydantic-core specifically.
+
+**Revised effort estimate: 2-4 person-months** for the embedded Python approach targeting AltStore distribution.
 
 ---
 
@@ -18,245 +21,298 @@ The Android self-contained experience uses:
 4. **SQLite database** — the server's default storage, requiring no external database server.
 5. The Android app provides lifecycle management: `setup_server()`, `start_server()`, `stop_server()`, and database import/export.
 
-This is clean and self-contained because Android allows:
-- Embedding arbitrary interpreters (Python via Chaquopy)
-- Running background services with network sockets
-- Sideloading APKs without a store
-- Apps binding to localhost ports
+---
+
+## iOS Tooling Landscape (as of early 2026)
+
+### BeeWare / Briefcase (Recommended)
+
+[BeeWare's Python-Apple-support](https://github.com/beeware/Python-Apple-support) provides pre-compiled CPython frameworks for iOS. [Briefcase](https://briefcase.beeware.org/en/v0.3.16/reference/platforms/iOS.html) is BeeWare's packaging tool that generates Xcode projects from Python apps.
+
+Key milestones reached:
+- **pip 24.3** supports iOS platform tags per [PEP 730](https://peps.python.org/pep-0730/)
+- **PyPI now accepts iOS wheel uploads** (enabled in 2025)
+- **cibuildwheel** supports iOS builds
+- BeeWare has published [iOS wheels for the `cryptography` package](https://beeware.org/news/buzz/november-2025-status-update/) (Rust-based, using maturin)
+- [Mobile wheel tracking](https://beeware.org/mobile-wheels/) covers the top 360 binary packages
+
+### Kivy / python-for-ios (Alternative)
+
+[kivy-ios](https://github.com/kivy/kivy-ios) (latest: 2025.5.17) provides a recipe-based toolchain. No pycryptodome recipe exists ([issue #701](https://github.com/kivy/kivy-ios/issues/701), [issue #755](https://github.com/kivy/kivy-ios/issues/755)). The cross-compilation environment sets the C compiler to `/bin/false`, causing C extension builds to fail. Less suitable than BeeWare for a non-Kivy server app.
+
+### Maturin / PyO3 iOS support
+
+[Maturin v1.7.0 added initial iOS support](https://github.com/PyO3/maturin/issues/1742). Subsequent releases added PEP 730-compliant wheel naming and iOS cross-platform venv support. This means Rust-based Python packages (like pydantic-core) can theoretically be cross-compiled for iOS, though pydantic-core itself hasn't done this yet.
+
+### AltStore Distribution
+
+AltStore installs IPAs via sideloading. Key facts:
+- App must be a standard IPA file
+- Standard AltStore requires re-signing every 7 days (free developer account)
+- AltStore PAL (EU only under Digital Markets Act) allows permanent installs
+- TrollStore (specific iOS versions, e.g., 14.0-16.6.1) allows permanent installs without re-signing
+- No App Store review guidelines apply — embedded interpreters are fine
 
 ---
 
-## iOS Constraints
+## Deep Dive: The Two Binary Dependencies
 
-### Platform Restrictions
-| Constraint | Impact |
-|---|---|
-| **No embedded interpreters** (App Store policy) | Cannot ship CPython in an App Store app. JIT/interpreters are restricted under App Review Guideline 2.5.2 |
-| **No sideloading** (without jailbreak or AltStore) | Must use TestFlight, AltStore, TrollStore, or jailbreak to install non-store apps |
-| **Background execution limits** | iOS aggressively suspends background apps. A server process will be killed within ~30 seconds of backgrounding |
-| **No Chaquopy equivalent** | There is no production-ready "embed Python in iOS app" SDK comparable to Chaquopy |
-| **App Sandbox** | Each app is sandboxed; two separate apps (server + game client) cannot communicate over localhost without Network Extension entitlements |
+### 1. `pycryptodomex` → Replace with `cryptography` (pyca)
 
-### What Still Works
-- **SQLite**: Works natively on iOS, no issue
-- **Localhost networking**: An app *can* listen on `127.0.0.1` while in the foreground
-- **The game client patcher**: Already supports iOS (IPA patching) per the README
+**Status**: No iOS wheels exist for pycryptodomex. [No kivy-ios recipe](https://github.com/kivy/kivy-ios/issues/701). Cross-compilation has [known issues](https://github.com/kivy/kivy-ios/issues/755).
 
----
+**Solution**: Replace with [`cryptography`](https://cryptography.io/) (pyca), which **already has iOS wheels** built by BeeWare. This is also a more actively maintained library.
 
-## Approach Options
+#### NPPS4 Crypto Operations Inventory
 
-### Option A: Single App with Embedded Python (Recommended)
+From analyzing the codebase, NPPS4 uses exactly these Cryptodome operations:
 
-**Concept**: Build a single iOS app that embeds both the Python server and the patched game client (via WKWebView or an embedded game engine).
+**`npps4/util.py`** — core request/response crypto:
+```
+Cryptodome.Hash.SHA1          — SHA1 hashing for message signing
+Cryptodome.Signature.pkcs1_15 — RSA PKCS1v1.5 signature (sign with server RSA key)
+Cryptodome.Cipher.PKCS1_v1_5  — RSA PKCS1v1.5 decryption (decrypt client messages)
+Cryptodome.Cipher.AES         — AES-CBC decryption (decrypt client payloads)
+Cryptodome.Util.Padding       — PKCS7 unpadding (used with AES-CBC, but code does manual unpadding)
+```
 
-**Technical approach**:
-- Use **Python-Apple-support** (BeeWare project) or **Kivy's python-for-ios** to cross-compile CPython and all dependencies for iOS/ARM64
-- Compile the pure-Python NPPS4 server and its dependencies into a framework
-- The native iOS app starts the Python server on `127.0.0.1:51376` in-process
-- The game client would need to be embedded or launched alongside
+**`npps4/data/schema.py`** — serial code encryption:
+```
+Cryptodome.Hash.SHA256         — SHA256 for PBKDF2
+Cryptodome.Protocol.KDF.PBKDF2 — Key derivation for serial codes
+Cryptodome.Cipher.AES          — AES-CTR encryption/decryption
+```
 
-**NPPS4 dependency analysis for iOS compilation**:
+**`npps4/config/config.py`** — key loading:
+```
+Cryptodome.PublicKey.RSA       — Load RSA private key from PEM file
+```
 
-| Dependency | iOS Compilable? | Notes |
+#### Mapping to `cryptography` (pyca) equivalents
+
+Every operation has a direct equivalent:
+
+| NPPS4 Usage | PyCryptodome | `cryptography` (pyca) Equivalent |
 |---|---|---|
-| `aiosqlite` | Yes | Pure Python, wraps built-in sqlite3 |
-| `alembic` | Yes | Pure Python |
-| `fastapi` | Yes | Pure Python |
-| `honkypy` | Yes | Pure Python wheel (`py3-none-any`) |
-| `httpx` | Yes | Pure Python |
-| `itsdangerous` | Yes | Pure Python |
-| `jinja2` | Yes | Pure Python |
-| `pycryptodomex` | **Needs cross-compile** | Contains C extensions for AES, RSA, SHA. Must be cross-compiled for ARM64. This is the hardest dependency |
-| `pydantic` / `pydantic-core` | **Needs cross-compile** | pydantic-core is written in Rust. Requires Rust cross-compilation for iOS ARM64 |
-| `python-multipart` | Yes | Pure Python |
-| `sqlalchemy` | Yes (mostly) | Core is pure Python; optional C extensions can be skipped |
-| `uvicorn` | Yes | Pure Python |
-| `httptools` | **Needs cross-compile** | C extension (optional, can fall back to pure Python parser) |
-| `uvloop` | **Skip** | Not needed; fall back to default asyncio event loop (already handled in `evloop.py`) |
+| Load RSA key | `Cryptodome.PublicKey.RSA.import_key()` | `serialization.load_pem_private_key()` |
+| RSA sign (SHA1 + PKCS1v1.5) | `pkcs1_15.new(key).sign(sha1_hash)` | `key.sign(data, padding.PKCS1v15(), hashes.SHA1())` |
+| RSA decrypt (PKCS1v1.5) | `PKCS1_v1_5.new(key).decrypt(data, None)` | `key.decrypt(data, padding.PKCS1v15())` |
+| AES-CBC decrypt | `AES.new(key, MODE_CBC, iv=iv)` | `Cipher(algorithms.AES(key), modes.CBC(iv))` |
+| AES-CTR encrypt/decrypt | `AES.new(key, MODE_CTR, nonce=n)` | `Cipher(algorithms.AES(key), modes.CTR(nonce))` |
+| SHA1 hash | `Cryptodome.Hash.SHA1.new(data)` | `hashes.Hash(hashes.SHA1())` |
+| SHA256 hash | `Cryptodome.Hash.SHA256` | `hashes.SHA256()` (for PBKDF2) |
+| PBKDF2 | `Cryptodome.Protocol.KDF.PBKDF2()` | `PBKDF2HMAC(hashes.SHA256(), ...)` |
 
-**Key challenge**: Cross-compiling `pycryptodomex` and `pydantic-core` for iOS ARM64. Both have significant native code.
+**Effort to migrate**: ~1-2 days. Only 3 files need changes (`util.py`, `data/schema.py`, `config/config.py`), plus the import in `make_server_key.py` and `util/decrypt_db_row.py` (utility scripts).
 
-**Effort: 4-6 months**
+**Risk**: Low. The `cryptography` package API is well-documented and the operations are standard. The migration is purely mechanical — same algorithms, different API surface.
 
-**Pros**:
-- True self-contained experience
-- No jailbreak required (for sideloading via AltStore/TrollStore)
-- Follows the same architectural pattern as Android
+### 2. `pydantic-core` → Build from source or downgrade to Pydantic v1
 
-**Cons**:
-- Cannot go on the App Store (interpreter policy)
-- Cross-compiling native Python extensions for iOS is fragile
-- Must be sideloaded (AltStore refreshes every 7 days, TrollStore requires specific iOS versions)
-- Background execution remains a problem—server dies when app is backgrounded
+**Status**: [No iOS wheels on PyPI](https://github.com/pydantic/pydantic-core/issues/1170). Issue #1170 remains open. The maintainer's position: "If rust/maturin/pyo3 can build for iOS, we would absolutely support it."
 
----
+**Since then**: Maturin v1.7.0+ supports iOS. BeeWare has successfully built other Rust-based iOS wheels (cryptography). The tooling is ready, but nobody has submitted a PR to pydantic-core's CI to add iOS wheel builds.
 
-### Option B: On-Device Container / Linux VM
+#### Option 2a: Cross-compile pydantic-core for iOS (Recommended)
 
-**Concept**: Run NPPS4 in a lightweight Linux environment on iOS via iSH, a-Shell, or UTM.
+**Approach**:
+1. Clone pydantic-core
+2. Install maturin ≥1.7.0 and Rust with iOS targets (`aarch64-apple-ios`, `aarch64-apple-ios-sim`)
+3. Set up a cross-compilation venv using BeeWare's Python-Apple-support
+4. Run `maturin build --target aarch64-apple-ios`
+5. Use the resulting wheel in the Briefcase project
 
-**Technical approach**:
-- **iSH** (Alpine Linux userspace emulator, available on App Store) can run Python
-- **a-Shell** (App Store app with Python support) could potentially run the server
-- **UTM** (QEMU-based VM for iOS) can run full Linux with Python
+**Effort**: 1-3 weeks (mostly fighting build system edge cases). BeeWare's success with `cryptography` proves the maturin→iOS pipeline works. The pydantic-core build is more complex (larger codebase, more Rust dependencies) but uses the same toolchain.
 
-**Effort: 1-2 months** (mostly documentation and testing)
+**Risk**: Medium. Maturin iOS support is still young. Build failures are likely and may require upstream patches to maturin or PyO3. However, BeeWare's team is actively supporting this use case and responsive to issues.
 
-**Pros**:
-- No custom iOS app development needed
-- Reuses the server as-is
-- Some options (iSH, a-Shell) are on the App Store
+#### Option 2b: Downgrade to Pydantic v1 (pure Python)
 
-**Cons**:
-- **Very slow**: iSH uses x86 emulation, not native ARM. Server would be 10-100x slower
-- **a-Shell** has limited Python package support (may not support pycryptodomex)
-- **UTM** requires sideloading and significant RAM/storage
-- User experience is poor (terminal-based setup)
-- Background execution still limited—iSH/a-Shell get suspended
-- Game client must run as a separate app, and cross-app localhost communication is unreliable on iOS
+**Approach**: Pin `pydantic<2.0` and adapt NPPS4 code to Pydantic v1 API.
+
+**Effort**: 2-4 weeks. NPPS4 uses Pydantic v2 features extensively (50+ files import pydantic, uses `model_validate`, `RootModel`, `model_computed_fields`, `TypeAdapter`, `pydantic-settings` v2 API). The migration would be significant and would sacrifice validation performance (5-50x slower per Pydantic benchmarks).
+
+**Risk**: High. Pydantic v1 is in maintenance-only mode (1.10.x-fixes branch). This creates ongoing maintenance burden and prevents using any Pydantic v2+ features.
+
+**Verdict**: Option 2a is strongly preferred. Option 2b is a last resort fallback.
+
+#### Option 2c: Build a minimal pydantic-core stub
+
+**Approach**: Create a pure-Python shim that implements just the pydantic-core validators NPPS4 actually uses.
+
+**Effort**: 3-6 weeks (reverse-engineering which pydantic-core validators are used).
+
+**Risk**: Very high. pydantic-core's API is internal and undocumented. Pydantic updates would break the shim.
+
+**Verdict**: Not recommended.
 
 ---
 
-### Option C: Rewrite Server in Swift/Native iOS
+## Implementation Plan for Embedded Python Route
 
-**Concept**: Port NPPS4 to Swift using native iOS frameworks (Vapor or SwiftNIO for the HTTP server, GRDB or Core Data for SQLite).
+### Phase 1: Dependency Resolution (2-4 weeks)
 
-**Technical approach**:
-- Rewrite the FastAPI server in **Vapor** (Swift web framework)
-- Use **CryptoKit** / **Security.framework** for RSA/AES/HMAC (all required crypto is available natively)
-- Use **GRDB.swift** or raw SQLite3 C API for database access
-- Embed in a single app alongside the game client
+1. **Replace pycryptodomex with cryptography** (~2 days)
+   - Migrate `npps4/util.py`: RSA sign, RSA decrypt, AES-CBC decrypt
+   - Migrate `npps4/data/schema.py`: PBKDF2, AES-CTR
+   - Migrate `npps4/config/config.py`: RSA key loading
+   - Update `requirements.txt`: replace `pycryptodomex` with `cryptography`
+   - Run existing tests to verify
 
-**Effort: 6+ months** (full rewrite of ~15k+ lines of Python)
+2. **Cross-compile pydantic-core for iOS** (~2-3 weeks)
+   - Set up macOS build environment with Xcode, Rust toolchain, iOS SDK targets
+   - Install maturin ≥1.7.0
+   - Create BeeWare Python-Apple-support cross-compilation venv
+   - Build pydantic-core wheel targeting `aarch64-apple-ios` and `aarch64-apple-ios-sim`
+   - Test the wheel in a minimal Briefcase iOS app
 
-**Pros**:
-- Truly native, best performance
-- Could potentially go on TestFlight
-- No background execution issues (server runs in-process)
-- No interpreter policy violations
+### Phase 2: iOS App Shell (3-5 weeks)
 
-**Cons**:
-- Enormous effort—full server rewrite
-- Must maintain two codebases going forward (Python + Swift)
-- Feature parity would lag behind the Python version
+3. **Create Briefcase project** (~1 week)
+   - Initialize Briefcase iOS project
+   - Configure `pyproject.toml` with all NPPS4 dependencies
+   - Include NPPS4 source, alembic configs, game data
+   - Add custom iOS wheels to project (pydantic-core, any others)
 
----
+4. **Implement iOS `main.py` (similar to `android_main.py`)** (~1 week)
+   - Port the `android_main.py` lifecycle API to iOS
+   - `setup_server()`, `start_server()`, `stop_server()`
+   - Database import/export
+   - Add `sys.platform == "ios"` handling in config.py, evloop.py, requirements
 
-### Option D: Proxy-Only (Server Runs Elsewhere)
+5. **Build native iOS UI** (~2-3 weeks)
+   - Swift/SwiftUI wrapper app with:
+     - Server start/stop controls
+     - Status indicator (server running/stopped)
+     - Server URL display (for manual client configuration)
+     - Database management (import/export/reset)
+     - Configuration editor (server settings)
+   - Integrate with Python via PythonKit or direct C-level embedding
 
-**Concept**: Don't run the server on iOS at all. Instead, provide a companion Mac/PC app or remote server, and only patch the iOS game client to connect to it.
+### Phase 3: Client Integration & Distribution (2-3 weeks)
 
-**Technical approach**:
-- Distribute a macOS/Windows/Linux server binary (already supported via PyInstaller in `npps4.spec`)
-- Patch the iOS game client (IPA) to point to `<LAN IP>:51376`
-- Sideload the patched IPA via AltStore/Sideloadly
+6. **Game client connectivity** (~1 week)
+   - Test patched iOS client connecting to embedded server on localhost
+   - Handle the "two apps" problem:
+     - Option A: Use a URL scheme to launch the game client from the server app
+     - Option B: Provide clear instructions for configuring the patched client
+   - Verify game functionality end-to-end
 
-**Effort: 1-2 weeks** (documentation only; infrastructure already exists)
+7. **AltStore/TrollStore packaging** (~1 week)
+   - Build release IPA from Xcode project
+   - Test installation via AltStore
+   - Test on TrollStore (if available)
+   - Document the installation process
 
-**Pros**:
-- Already works today with existing tooling
-- No iOS server development needed
-- Best user experience for the game itself
-
-**Cons**:
-- **Not self-contained**: requires a separate computer running the server
-- Only works on local network (or requires VPN/port forwarding for remote)
-
----
-
-### Option E: Local Network with macOS (Hybrid Self-Contained)
-
-**Concept**: Ship a polished macOS app (for Mac or Apple Silicon) that runs the server, paired with a patched iOS client. Use Bonjour/mDNS for zero-configuration discovery.
-
-**Technical approach**:
-- Package NPPS4 as a macOS app using PyInstaller (spec already exists) or py2app
-- Add Bonjour service advertisement so the iOS client can auto-discover the server
-- Patch iOS client to scan for local servers
-
-**Effort: 1-2 months**
-
-**Pros**:
-- Leverages existing PyInstaller infrastructure
-- Good UX with auto-discovery
-- macOS has no interpreter restrictions
-
-**Cons**:
-- Requires a Mac (not truly self-contained on iOS alone)
+8. **Testing & polish** (~1 week)
+   - Test on multiple iOS versions (15+)
+   - Test app suspension/resume behavior
+   - Test memory pressure handling
+   - Test database integrity under abrupt termination
 
 ---
 
-## Specific Code Changes Needed
+## iOS-Specific Code Changes in NPPS4
 
-Regardless of approach, these server-side changes would help iOS support:
+### Required Changes
 
-### 1. Background Keep-Alive (Options A/B)
-The server needs to handle being suspended and resumed. iOS sends `applicationWillResignActive` / `applicationDidBecomeActive` signals. The server should:
-- Gracefully pause when backgrounded
-- Resume quickly when foregrounded
-- Use iOS background task API for brief extensions
+1. **Platform detection** — `sys.platform` returns `"ios"` on CPython 3.13+ per [PEP 730](https://peps.python.org/pep-0730/)
+   - `config.py:106`: Add iOS to the `sys.platform == "android"` branch
+   - `requirements.txt`: Add iOS platform markers (same as Android minus uvloop)
+   - `evloop.py`: Already handles missing uvloop gracefully
 
-### 2. Foreground-Only Server Mode
-Add a configuration option for "foreground-only" mode where the server:
-- Doesn't rely on persistent background execution
-- Checkpoints database state aggressively (SQLite WAL mode already helps)
-- Handles abrupt termination gracefully
+2. **Crypto library swap** (see Phase 1 above)
 
-### 3. Reduced Memory Footprint
-iOS devices have tighter memory limits (especially with two "apps" running). Consider:
-- Lazy-loading game data modules (already partially done)
-- Reducing default worker count to 1 (already the case in `android_main.py`)
-- Connection pooling limits for SQLite
+3. **`ios_main.py`** — New file, modeled on `android_main.py`:
+   ```python
+   # Same API surface as android_main.py:
+   # setup_server(), start_server(), stop_server()
+   # import_database(), export_database(), nuke_database()
+   ```
 
-### 4. `evloop.py` Already Handles Missing uvloop
-The event loop fallback (`evloop.py:28-30`) already gracefully falls back to the default asyncio loop when uvloop is unavailable, which is good for iOS where uvloop won't compile.
+4. **Background handling** — iOS kills apps ~30 seconds after backgrounding:
+   - Use `BGTaskScheduler` for brief background execution
+   - Checkpoint database (SQLite WAL flush) on `applicationWillResignActive`
+   - Fast resume on `applicationDidBecomeActive`
+   - Accept that the server stops when the app is backgrounded (same UX as game itself)
 
-### 5. Platform Detection
-Add `sys.platform == "ios"` handling alongside the existing `sys.platform == "android"` checks:
-- `config.py:106` — module loading behavior
-- `requirements.txt` — conditional dependencies
-- `evloop.py` — event loop selection
+### Nice-to-Have Changes
+
+5. **Reduced import time** — Briefcase apps load all Python at startup. Lazy imports help.
+6. **Memory budget** — iOS gives ~300-500MB to foreground apps on modern devices. NPPS4 uses ~50-100MB. Comfortable headroom.
 
 ---
 
-## Storage and Resource Requirements
+## Risk Assessment
 
-The server has modest resource needs, well within iOS device capabilities:
+| Risk | Likelihood | Impact | Mitigation |
+|---|---|---|---|
+| pydantic-core fails to cross-compile for iOS | Medium | **Blocks project** | Fall back to Pydantic v1 (Option 2b), or contribute the fix upstream to maturin/PyO3 |
+| BeeWare/Briefcase has iOS bugs | Medium | Delays | Active project, responsive maintainers, file issues |
+| Game client can't connect to localhost on iOS | Low | **Blocks project** | Standard iOS networking, well-tested by other apps |
+| App gets killed during gameplay | Low | Poor UX | Users must keep server app foregrounded (split-screen or app switching) |
+| AltStore 7-day re-signing annoys users | Medium | Poor UX | Recommend TrollStore where available; AltStore PAL in EU |
+| Apple blocks embedded Python in sideloaded apps | Very Low | **Blocks project** | Not subject to App Store review; Apple doesn't police sideloaded app internals |
 
-| Resource | Requirement | iOS Feasible? |
-|---|---|---|
-| **CPU** | Light (async I/O, single worker) | Yes |
-| **RAM** | ~50-100 MB typical | Yes |
-| **Storage (server code)** | ~10-20 MB | Yes |
-| **Storage (game database)** | ~50-500 MB depending on content | Yes |
-| **Storage (game assets)** | Can use `n4dlapi` backend to download on-demand | Yes |
-| **Network** | Localhost only (loopback) | Yes (while foregrounded) |
+---
+
+## Architecture Diagram
+
+```
+┌─────────────────────────────────────────────┐
+│                iOS Device                    │
+│                                              │
+│  ┌─────────────────────────────────────────┐ │
+│  │    NPPS4 Server App (via AltStore)      │ │
+│  │                                         │ │
+│  │  ┌──────────────────┐  ┌─────────────┐ │ │
+│  │  │ Swift UI Shell   │  │ Python      │ │ │
+│  │  │ (Start/Stop/     │──│ Runtime     │ │ │
+│  │  │  Status/Config)  │  │ (BeeWare)   │ │ │
+│  │  └──────────────────┘  │             │ │ │
+│  │                        │ FastAPI     │ │ │
+│  │                        │ uvicorn     │ │ │
+│  │                        │ SQLite      │ │ │
+│  │                        │ 127.0.0.1   │ │ │
+│  │                        │ :51376      │ │ │
+│  │                        └─────────────┘ │ │
+│  └────────────────────────────┬────────────┘ │
+│                               │ localhost    │
+│  ┌────────────────────────────┴────────────┐ │
+│  │    Patched SIF Client (via AltStore)    │ │
+│  │    Points to 127.0.0.1:51376            │ │
+│  └─────────────────────────────────────────┘ │
+└──────────────────────────────────────────────┘
+```
 
 ---
 
 ## Recommendation
 
-**For immediate impact** (weeks, not months):
-- **Option D** — Document and streamline the existing "server on PC + patched iOS client" workflow. This already works.
+**The embedded Python route via BeeWare Briefcase is viable and recommended for AltStore distribution.**
 
-**For a true self-contained experience** (months):
-- **Option A** — Embedded Python in a single iOS app, distributed via AltStore/TrollStore. This mirrors the Android architecture most closely. The main work is:
-  1. Cross-compiling `pycryptodomex` and `pydantic-core` for iOS ARM64
-  2. Building an iOS app shell that manages the Python server lifecycle
-  3. Handling iOS background execution limits
-  4. Packaging and distribution via AltStore/TrollStore
+The critical path is:
+1. Replace `pycryptodomex` → `cryptography` (pyca) — **low risk, 2 days**
+2. Cross-compile `pydantic-core` for iOS via maturin — **medium risk, 2-3 weeks**
+3. Build the Briefcase iOS app shell — **low risk, 3-5 weeks**
+4. Package and test with AltStore — **low risk, 1-2 weeks**
 
-**For long-term sustainability** (if iOS is a primary target):
-- **Option C** — Native Swift rewrite, but only if there's a team willing to maintain dual codebases.
+**Total: 2-3 months** with the crypto library swap making the biggest single dependency (pycryptodomex) a non-issue.
+
+The pydantic-core cross-compilation is the only real unknown, but the tooling (maturin iOS support, BeeWare's success with the `cryptography` package) strongly suggests it's achievable. If it proves impossible, falling back to Pydantic v1 is ugly but workable.
 
 ---
 
-## Summary Table
+## References
 
-| Approach | Self-Contained? | Effort | UX Quality | App Store? |
-|---|---|---|---|---|
-| **A: Embedded Python** | Yes | 4-6 months | Good | No (sideload) |
-| **B: iSH / a-Shell** | Partially | 1-2 months | Poor | Partially |
-| **C: Swift Rewrite** | Yes | 6+ months | Excellent | Possible |
-| **D: Server on PC** | No | 1-2 weeks | Good | N/A |
-| **E: macOS + iOS** | Paired | 1-2 months | Good | N/A |
+- [BeeWare Python-Apple-support](https://github.com/beeware/Python-Apple-support)
+- [BeeWare Briefcase iOS docs](https://briefcase.beeware.org/en/v0.3.16/reference/platforms/iOS.html)
+- [BeeWare mobile wheels leaderboard](https://beeware.org/mobile-wheels/)
+- [BeeWare November 2025 update (cryptography iOS wheels)](https://beeware.org/news/buzz/november-2025-status-update/)
+- [Maturin iOS support (v1.7.0)](https://github.com/PyO3/maturin/releases/tag/v1.7.0)
+- [Maturin iOS issue #1742](https://github.com/PyO3/maturin/issues/1742)
+- [pydantic-core iOS support issue #1170](https://github.com/pydantic/pydantic-core/issues/1170)
+- [kivy-ios pycryptodome issue #701](https://github.com/kivy/kivy-ios/issues/701)
+- [kivy-ios pycryptodome issue #755](https://github.com/kivy/kivy-ios/issues/755)
+- [PEP 730 — iOS platform tags](https://peps.python.org/pep-0730/)
+- [pyca/cryptography RSA docs](https://cryptography.io/en/latest/hazmat/primitives/asymmetric/rsa/)
