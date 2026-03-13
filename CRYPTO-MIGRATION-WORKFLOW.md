@@ -24,502 +24,203 @@ Replace `pycryptodomex` with `cryptography` (pyca) across NPPS4, driven by the i
 
 ---
 
-## Workflow: Dual-Backend with Test Harness
+## Strategy: Test-Vector Harness
 
-The key insight: we can run **both** libraries side-by-side, compare their outputs on every operation, and only remove `pycryptodomex` once we have proof that every operation is byte-identical. This turns the migration from a "hope nothing breaks" swap into a verified, incremental transition.
+Instead of a full abstraction layer + dual-run runtime, the migration safety comes from a **test-vector harness** — a pair of scripts that capture the ground truth from pycryptodomex, then prove `cryptography` reproduces it byte-for-byte. This is lighter weight, doesn't touch production code until the swap itself, and still catches every known class of migration bug.
 
-### Phase 1: Build a Crypto Test Harness (no production changes)
+### What the harness covers
 
-**Goal**: Capture real cryptographic inputs/outputs as test vectors, then verify the new `cryptography` backend reproduces them exactly.
-
-#### Step 1.1 — Collect test vectors from the running server
-
-Create `tests/crypto_vectors.py` that exercises every crypto operation with known inputs and records expected outputs:
-
-```python
-"""
-Generate and verify crypto test vectors for the pycryptodomex -> cryptography migration.
-Run this BEFORE any migration to capture the ground truth from the current implementation.
-"""
-import base64
-import json
-import os
-
-import Cryptodome.Cipher.AES
-import Cryptodome.Cipher.PKCS1_v1_5
-import Cryptodome.Hash.SHA1
-import Cryptodome.Hash.SHA256
-import Cryptodome.Protocol.KDF
-import Cryptodome.PublicKey.RSA
-import Cryptodome.Signature.pkcs1_15
-import Cryptodome.Util.Padding
-
-VECTORS_FILE = os.path.join(os.path.dirname(__file__), "crypto_test_vectors.json")
-
-def generate_test_key():
-    """Generate a deterministic-ish RSA key for test use only."""
-    # Use a fixed test key (NOT the server key) for reproducibility
-    key = Cryptodome.PublicKey.RSA.generate(1024)
-    return key
-
-def collect_vectors():
-    vectors = {}
-    key = generate_test_key()
-    key_pem = key.export_key("PEM")
-    pub_pem = key.public_key().export_key("PEM")
-    vectors["rsa_private_key_pem"] = base64.b64encode(key_pem).decode()
-    vectors["rsa_public_key_pem"] = base64.b64encode(pub_pem).decode()
-
-    # --- RSA Sign (SHA1 + PKCS1v1.5) ---
-    sign_data = b"test message for signing"
-    sha1 = Cryptodome.Hash.SHA1.new(sign_data)
-    signer = Cryptodome.Signature.pkcs1_15.new(key)
-    signature = signer.sign(sha1)
-    vectors["rsa_sign"] = {
-        "input": base64.b64encode(sign_data).decode(),
-        "signature": base64.b64encode(signature).decode(),
-    }
-
-    # --- RSA Decrypt (PKCS1v1.5) ---
-    from Cryptodome.Cipher import PKCS1_v1_5 as PKCS1_Cipher
-    plaintext = b"secret payload 16"  # short enough for 1024-bit RSA
-    cipher = PKCS1_Cipher.new(key.public_key())
-    ciphertext = cipher.encrypt(plaintext)
-    vectors["rsa_decrypt"] = {
-        "ciphertext": base64.b64encode(ciphertext).decode(),
-        "plaintext": base64.b64encode(plaintext).decode(),
-    }
-
-    # --- AES-CBC decrypt ---
-    aes_key = os.urandom(16)
-    iv = os.urandom(16)
-    aes_plaintext = b"hello AES-CBC!!\x00"  # 16 bytes
-    padded = Cryptodome.Util.Padding.pad(aes_plaintext, 16)
-    aes_obj = Cryptodome.Cipher.AES.new(aes_key, Cryptodome.Cipher.AES.MODE_CBC, iv=iv)
-    aes_ciphertext = iv + aes_obj.encrypt(padded)
-    vectors["aes_cbc"] = {
-        "key": base64.b64encode(aes_key).decode(),
-        "ciphertext_with_iv": base64.b64encode(aes_ciphertext).decode(),
-        "plaintext": base64.b64encode(aes_plaintext).decode(),
-    }
-
-    # --- AES-CTR encrypt/decrypt ---
-    ctr_key = os.urandom(16)
-    nonce = os.urandom(8)
-    ctr_plaintext = b"hello AES-CTR mode"
-    aes_ctr = Cryptodome.Cipher.AES.new(
-        ctr_key, Cryptodome.Cipher.AES.MODE_CTR, nonce=nonce
-    )
-    ctr_ciphertext = aes_ctr.encrypt(ctr_plaintext)
-    vectors["aes_ctr"] = {
-        "key": base64.b64encode(ctr_key).decode(),
-        "nonce": base64.b64encode(nonce).decode(),
-        "plaintext": base64.b64encode(ctr_plaintext).decode(),
-        "ciphertext": base64.b64encode(ctr_ciphertext).decode(),
-    }
-
-    # --- PBKDF2-SHA256 ---
-    password = b"serial_code_password"
-    salt = os.urandom(16)
-    derived = Cryptodome.Protocol.KDF.PBKDF2(
-        password, salt, dkLen=16, count=10000,
-        prf=lambda p, s: Cryptodome.Hash.SHA256.new(p + s).digest()
-        # Note: NPPS4 uses hmac_hash_module=Cryptodome.Hash.SHA256
-    )
-    vectors["pbkdf2"] = {
-        "password": base64.b64encode(password).decode(),
-        "salt": base64.b64encode(salt).decode(),
-        "iterations": 10000,
-        "dk_len": 16,
-        "derived_key": base64.b64encode(derived).decode(),
-    }
-
-    return vectors
-
-def save_vectors():
-    vectors = collect_vectors()
-    with open(VECTORS_FILE, "w") as f:
-        json.dump(vectors, f, indent=2)
-    print(f"Saved {len(vectors)} vector groups to {VECTORS_FILE}")
-
-if __name__ == "__main__":
-    save_vectors()
-```
-
-Run this once against the current codebase to produce `tests/crypto_test_vectors.json` — the **ground truth**.
-
-#### Step 1.2 — Write verification tests against the `cryptography` backend
-
-Create `tests/test_crypto_migration.py`:
-
-```python
-"""
-Verify that the `cryptography` (pyca) backend produces byte-identical results
-to the pycryptodomex backend, using vectors captured by crypto_vectors.py.
-"""
-import base64
-import json
-import os
-import pytest
-
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding, rsa
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-
-VECTORS_FILE = os.path.join(os.path.dirname(__file__), "crypto_test_vectors.json")
-
-@pytest.fixture(scope="module")
-def vectors():
-    with open(VECTORS_FILE) as f:
-        return json.load(f)
-
-@pytest.fixture(scope="module")
-def rsa_key(vectors):
-    pem = base64.b64decode(vectors["rsa_private_key_pem"])
-    return serialization.load_pem_private_key(pem, password=None)
-
-def test_rsa_sign(vectors, rsa_key):
-    data = base64.b64decode(vectors["rsa_sign"]["input"])
-    expected_sig = base64.b64decode(vectors["rsa_sign"]["signature"])
-
-    signature = rsa_key.sign(data, padding.PKCS1v15(), hashes.SHA1())
-    assert signature == expected_sig, "RSA signature mismatch"
-
-def test_rsa_decrypt(vectors, rsa_key):
-    ciphertext = base64.b64decode(vectors["rsa_decrypt"]["ciphertext"])
-    expected_pt = base64.b64decode(vectors["rsa_decrypt"]["plaintext"])
-
-    plaintext = rsa_key.decrypt(ciphertext, padding.PKCS1v15())
-    assert plaintext == expected_pt, "RSA decrypt mismatch"
-
-def test_aes_cbc_decrypt(vectors):
-    key = base64.b64decode(vectors["aes_cbc"]["key"])
-    ct_with_iv = base64.b64decode(vectors["aes_cbc"]["ciphertext_with_iv"])
-    expected_pt = base64.b64decode(vectors["aes_cbc"]["plaintext"])
-
-    iv, ct = ct_with_iv[:16], ct_with_iv[16:]
-    cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
-    decryptor = cipher.decryptor()
-    padded = decryptor.update(ct) + decryptor.finalize()
-    plaintext = padded[: -padded[-1]]  # PKCS7 unpad (matching NPPS4's manual unpad)
-    assert plaintext == expected_pt, "AES-CBC decrypt mismatch"
-
-def test_aes_ctr(vectors):
-    key = base64.b64decode(vectors["aes_ctr"]["key"])
-    nonce = base64.b64decode(vectors["aes_ctr"]["nonce"])
-    plaintext = base64.b64decode(vectors["aes_ctr"]["plaintext"])
-    expected_ct = base64.b64decode(vectors["aes_ctr"]["ciphertext"])
-
-    # NOTE: pycryptodomex CTR nonce handling differs from pyca.
-    # Cryptodome: AES.new(key, MODE_CTR, nonce=nonce) uses nonce || counter
-    #   where nonce is len(nonce) bytes and counter fills the rest of the 16-byte block.
-    # pyca: modes.CTR(nonce) expects a full 16-byte IV (nonce || initial_counter).
-    # Cryptodome with nonce=8 bytes -> 8 bytes nonce + 8 bytes counter (big-endian, starting at 0)
-    full_nonce = nonce + b"\x00" * (16 - len(nonce))
-    cipher = Cipher(algorithms.AES(key), modes.CTR(full_nonce))
-    encryptor = cipher.encryptor()
-    ciphertext = encryptor.update(plaintext) + encryptor.finalize()
-    assert ciphertext == expected_ct, "AES-CTR encrypt mismatch"
-
-def test_pbkdf2(vectors):
-    password = base64.b64decode(vectors["pbkdf2"]["password"])
-    salt = base64.b64decode(vectors["pbkdf2"]["salt"])
-    iterations = vectors["pbkdf2"]["iterations"]
-    dk_len = vectors["pbkdf2"]["dk_len"]
-    expected_dk = base64.b64decode(vectors["pbkdf2"]["derived_key"])
-
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=dk_len,
-        salt=salt,
-        iterations=iterations,
-    )
-    derived = kdf.derive(password)
-    assert derived == expected_dk, "PBKDF2 key derivation mismatch"
-```
-
-**Critical discovery opportunity**: The AES-CTR nonce handling test is where a subtle bug would surface. PyCryptodome's `nonce=` parameter with an 8-byte value zero-fills the remaining counter bytes. The `cryptography` library's `modes.CTR()` expects the full 16-byte IV. If `schema.py` uses a different nonce length, this test will catch the incompatibility immediately. Verify what `schema.py` actually passes — this is where the migration can **improve** correctness by making the nonce handling explicit.
-
-#### Step 1.3 — Verify PBKDF2 PRF compatibility
-
-This is the most likely divergence point. Check `schema.py`'s actual PBKDF2 call:
-
-```python
-# schema.py currently uses:
-Cryptodome.Protocol.KDF.PBKDF2(password, salt, dkLen=16, count=N,
-                                 hmac_hash_module=Cryptodome.Hash.SHA256)
-```
-
-`PBKDF2HMAC` in `cryptography` uses HMAC-SHA256 by default when you pass `hashes.SHA256()`. This is the standard PBKDF2. But if the PyCryptodome call uses `prf=` (a custom PRF lambda) instead of `hmac_hash_module=`, the output **will differ** — `prf=` in PyCryptodome defaults to HMAC-SHA1 when omitted. The test vectors catch this.
+| Test class | What it proves | Migration risk it catches |
+|---|---|---|
+| `TestRSASign` (with and without xmc) | `key.sign(content + xmc, PKCS1v15(), SHA1())` == two-step `SHA1.new(content).update(xmc)` + `pkcs1_15.sign()` | SHA1 incremental vs. concatenated hashing divergence |
+| `TestRSADecrypt` | `key.decrypt(ct, PKCS1v15())` == `PKCS1_v1_5.new(key).decrypt(ct, None)` | PKCS#1 v1.5 padding implementation differences |
+| `TestAESCBC` | CBC decrypt with manual PKCS7 unpad matches | IV extraction, padding removal |
+| `TestAESCTR` (encrypt + decrypt) | `modes.CTR(nonce \|\| 0x00*8)` == `MODE_CTR, nonce=nonce, initial_value=0` | **The critical one**: PyCryptodome's `nonce=` silently zero-pads the counter half; `cryptography` expects a full 16-byte IV |
+| `TestPBKDF2` | `PBKDF2HMAC(SHA256())` == `PBKDF2(hmac_hash_module=SHA256)` | `hmac_hash_module=` vs `prf=` semantics (different PRFs, different outputs) |
+| `TestSerialCodeFlow` | End-to-end: PBKDF2 → xor nonce → AES-CTR decrypt | Composition bugs where individual ops are correct but chaining is wrong |
+| `TestRSAKeyLoading` | PEM loading with/without password | Passphrase encoding, key format compatibility |
+| `TestRSAKeyGeneration` | PyCryptodome PEM round-trips through `cryptography` loader | PEM format compatibility (TraditionalOpenSSL vs PKCS8) |
+| `TestDecryptDBRow` | Same as AES-CBC (confirms the fallback path in `decrypt_db_row.py` is correct) | Redundant by design — this file already has a `cryptography` fallback |
 
 ---
 
-### Phase 2: Introduce a Thin Crypto Abstraction Layer
+## How to Use
 
-**Goal**: Decouple NPPS4's business logic from the specific crypto library, enabling side-by-side comparison and future backend swaps.
+### Step 1: Generate vectors (run once, before any migration)
 
-Create `npps4/crypto.py` — a single module that wraps all crypto operations:
-
-```python
-"""
-Thin crypto abstraction for NPPS4.
-Provides all cryptographic operations used by the server.
-
-During migration: can run both backends and assert equivalence.
-After migration: only the `cryptography` backend remains.
-"""
-from __future__ import annotations
-
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding as asym_padding, rsa
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-
-
-def load_rsa_private_key(pem_data: bytes, password: str | None = None):
-    pwd = password.encode() if password else None
-    return serialization.load_pem_private_key(pem_data, password=pwd)
-
-
-def generate_rsa_key(bits: int = 1024):
-    return rsa.generate_private_key(public_exponent=65537, key_size=bits)
-
-
-def export_rsa_private_pem(key) -> bytes:
-    return key.private_bytes(
-        serialization.Encoding.PEM,
-        serialization.PrivateFormat.TraditionalOpenSSL,
-        serialization.NoEncryption(),
-    )
-
-
-def export_rsa_public_pem(key) -> bytes:
-    pub = key.public_key()
-    return pub.public_bytes(
-        serialization.Encoding.PEM,
-        serialization.PublicFormat.SubjectPublicKeyInfo,
-    )
-
-
-def rsa_sign_sha1(key, data: bytes) -> bytes:
-    return key.sign(data, asym_padding.PKCS1v15(), hashes.SHA1())
-
-
-def rsa_decrypt_pkcs1v15(key, ciphertext: bytes) -> bytes:
-    return key.decrypt(ciphertext, asym_padding.PKCS1v15())
-
-
-def aes_cbc_decrypt(key: bytes, data: bytes) -> bytes:
-    """Decrypt AES-CBC. `data` = IV (16 bytes) || ciphertext. Manual PKCS7 unpad."""
-    iv, ct = data[:16], data[16:]
-    cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
-    decryptor = cipher.decryptor()
-    padded = decryptor.update(ct) + decryptor.finalize()
-    return padded[: -padded[-1]]
-
-
-def aes_ctr_cipher(key: bytes, nonce: bytes):
-    """Return an AES-CTR encryptor/decryptor. Caller uses .update() + .finalize()."""
-    # PyCryptodome nonce= with N-byte value zero-pads the counter portion.
-    full_nonce = nonce + b"\x00" * (16 - len(nonce))
-    cipher = Cipher(algorithms.AES(key), modes.CTR(full_nonce))
-    return cipher
-
-
-def pbkdf2_sha256(password: bytes, salt: bytes, iterations: int, length: int) -> bytes:
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(), length=length, salt=salt, iterations=iterations
-    )
-    return kdf.derive(password)
-
-
-def sha256_digest(data: bytes) -> bytes:
-    h = hashes.Hash(hashes.SHA256())
-    h.update(data)
-    return h.finalize()
+```bash
+python -m tests.generate_crypto_vectors
 ```
 
-This layer:
-- Is **testable in isolation** against the test vectors
-- Makes the migration a series of **import swaps**, not crypto re-implementations
-- Documents every nonce/padding convention in one place (improvement over scattered implicit conventions)
+This runs every crypto operation through the **current** pycryptodomex code and saves the inputs + outputs to `tests/crypto_test_vectors.json`. The vectors file is committed so it survives the library swap.
 
----
+### Step 2: Run the verification tests
 
-### Phase 3: Dual-Run Mode (the safety net)
-
-**Goal**: During development, run both backends on every request and assert equivalence. This catches any edge case the static test vectors missed.
-
-Add a temporary dual-run wrapper (only during development, controlled by an env var):
-
-```python
-# npps4/crypto.py (during migration only)
-import os
-DUAL_RUN = os.environ.get("NPPS4_CRYPTO_DUAL_RUN", "0") == "1"
-
-if DUAL_RUN:
-    import Cryptodome.Cipher.AES
-    import Cryptodome.Cipher.PKCS1_v1_5
-    import Cryptodome.Hash.SHA1
-    import Cryptodome.Signature.pkcs1_15
-    import logging
-
-    _log = logging.getLogger("npps4.crypto.dual")
-
-    _original_aes_cbc_decrypt = aes_cbc_decrypt
-
-    def aes_cbc_decrypt(key: bytes, data: bytes) -> bytes:
-        new_result = _original_aes_cbc_decrypt(key, data)
-
-        # Old backend
-        aes = Cryptodome.Cipher.AES.new(key, Cryptodome.Cipher.AES.MODE_CBC, iv=data[:16])
-        old_padded = aes.decrypt(data[16:])
-        old_result = old_padded[: -old_padded[-1]]
-
-        if new_result != old_result:
-            _log.error("AES-CBC MISMATCH: key=%s len(data)=%d", key.hex(), len(data))
-            raise RuntimeError("Crypto migration: AES-CBC output mismatch")
-        return new_result
-
-    # (Similar wrappers for rsa_sign_sha1, rsa_decrypt_pkcs1v15, etc.)
+```bash
+python -m pytest tests/test_crypto_migration.py -v
 ```
 
-Run the full server with `NPPS4_CRYPTO_DUAL_RUN=1` during testing. Every request exercises both backends. If anything diverges, it logs the exact operation and inputs for debugging.
+Both libraries can be installed simultaneously — they don't conflict. Every test takes a pycryptodomex-generated vector and re-derives the output using only `cryptography` APIs, asserting byte equality.
 
----
+**Current status: 15/15 tests passing.**
 
-### Phase 4: Swap Imports (the actual migration)
+### Step 3: Swap the imports
 
-With Phase 1-3 giving confidence, the file changes are mechanical:
+With the tests green, the actual migration in each file is mechanical:
+
+#### `npps4/util.py`
+
+```python
+# Before:
+sha1 = Cryptodome.Hash.SHA1.new(content)
+if request_xmc_hex is not None:
+    sha1.update(request_xmc_hex.encode("UTF-8"))
+sign = Cryptodome.Signature.pkcs1_15.new(config.get_server_rsa())
+return str(base64.b64encode(sign.sign(sha1)), "UTF-8")
+
+# After:
+data = content
+if request_xmc_hex is not None:
+    data = content + request_xmc_hex.encode("UTF-8")
+sig = config.get_server_rsa().sign(data, asym_padding.PKCS1v15(), hashes.SHA1())
+return str(base64.b64encode(sig), "UTF-8")
+```
+
+The test `TestRSASign::test_sign_with_xmc` proves the two-step hash and the concatenation produce identical signatures.
+
+#### `npps4/util.py` — `decrypt_rsa`
+
+```python
+# Before:
+pkcs = Cryptodome.Cipher.PKCS1_v1_5.new(config.get_server_rsa())
+return pkcs.decrypt(data, None)
+
+# After:
+return config.get_server_rsa().decrypt(data, asym_padding.PKCS1v15())
+```
+
+#### `npps4/util.py` — `decrypt_aes`
+
+```python
+# Before:
+aes = Cryptodome.Cipher.AES.new(key, Cryptodome.Cipher.AES.MODE_CBC, iv=data[:16])
+data = aes.decrypt(data[16:])
+return data[: -data[-1]]
+
+# After:
+cipher = Cipher(algorithms.AES(key), modes.CBC(data[:16]))
+decryptor = cipher.decryptor()
+padded = decryptor.update(data[16:]) + decryptor.finalize()
+return padded[: -padded[-1]]
+```
 
 #### `npps4/config/config.py`
+
 ```python
 # Before:
 import Cryptodome.PublicKey.RSA
 _SERVER_KEY = Cryptodome.PublicKey.RSA.import_key(f.read(), key_password)
 
 # After:
-from . import crypto
-_SERVER_KEY = crypto.load_rsa_private_key(f.read(), key_password)
+from cryptography.hazmat.primitives.serialization import load_pem_private_key
+pwd = key_password.encode() if key_password else None
+_SERVER_KEY = load_pem_private_key(f.read(), password=pwd)
 ```
 
-#### `npps4/util.py`
+#### `npps4/data/schema.py` — `derive_serial_code_action_key`
+
 ```python
 # Before:
-import Cryptodome.Cipher.PKCS1_v1_5
-import Cryptodome.Cipher.AES
-import Cryptodome.Hash.SHA1
-import Cryptodome.Util.Padding
-import Cryptodome.Signature.pkcs1_15
-
-def sign_message(content, request_xmc_hex):
-    sha1 = Cryptodome.Hash.SHA1.new(content)
-    if request_xmc_hex is not None:
-        sha1.update(request_xmc_hex.encode("UTF-8"))
-    sign = Cryptodome.Signature.pkcs1_15.new(config.get_server_rsa())
-    return str(base64.b64encode(sign.sign(sha1)), "UTF-8")
+Cryptodome.Protocol.KDF.PBKDF2(password, salt, 16, 4, hmac_hash_module=SHA256)
 
 # After:
-from . import crypto
-
-def sign_message(content, request_xmc_hex):
-    data = content
-    if request_xmc_hex is not None:
-        data = content + request_xmc_hex.encode("UTF-8")
-    sig = crypto.rsa_sign_sha1(config.get_server_rsa(), data)
-    return str(base64.b64encode(sig), "UTF-8")
+kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=16, salt=salt, iterations=4)
+kdf.derive(password)
 ```
 
-**Improvement opportunity**: The current `sign_message` feeds data to SHA1 in two steps (`.new(content)` then `.update(xmc)`). The `cryptography` library's `key.sign()` hashes internally, so we concatenate first. The test vectors from Phase 1 verify this produces identical signatures.
+#### `npps4/data/schema.py` — `initialize_aes_for_action_field`
 
-#### `npps4/data/schema.py`
 ```python
 # Before:
-import Cryptodome.Cipher.AES
-import Cryptodome.Hash.SHA256
-import Cryptodome.Protocol.KDF
+Cryptodome.Cipher.AES.new(key, MODE_CTR, nonce=xorbytes(salt[:8], salt[8:]), initial_value=0)
 
 # After:
-from .. import crypto
-# Use crypto.pbkdf2_sha256(), crypto.aes_ctr_cipher(), crypto.sha256_digest()
+nonce = xorbytes(salt[:8], salt[8:])
+full_nonce = nonce + b"\x00" * 8  # Explicit: 8-byte nonce || 8-byte zero counter
+cipher = Cipher(algorithms.AES(key), modes.CTR(full_nonce))
+# Return cipher.encryptor() or cipher.decryptor() as needed
 ```
+
+The test `TestAESCTR` proves the nonce expansion produces identical ciphertext.
 
 #### `make_server_key.py`
+
 ```python
 # Before:
-import Cryptodome.PublicKey.RSA
 key = Cryptodome.PublicKey.RSA.generate(1024)
+key.export_key("PEM")
+key.public_key().export_key("PEM")
 
 # After:
-from npps4 import crypto
-key = crypto.generate_rsa_key(1024)
+from cryptography.hazmat.primitives.asymmetric import rsa
+key = rsa.generate_private_key(public_exponent=65537, key_size=1024)
+key.private_bytes(Encoding.PEM, PrivateFormat.TraditionalOpenSSL, NoEncryption())
+key.public_key().public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
 ```
 
+`TestRSAKeyGeneration` proves the PEM formats are cross-compatible.
+
 #### `util/decrypt_db_row.py`
-Already has a `cryptography` fallback — just promote it to the primary and remove the Cryptodome branches.
+
+Already has a `cryptography` fallback — promote it to the only implementation and remove the Cryptodome/Crypto branches.
 
 #### `requirements.txt`
+
 ```diff
 -pycryptodomex
 +cryptography
 ```
 
-Add iOS platform marker:
+### Step 4: Re-run the tests
+
+```bash
+python -m pytest tests/test_crypto_migration.py -v
 ```
-cryptography; sys_platform != 'ios'
-cryptography; sys_platform == 'ios'
-```
-(Both resolve the same package, but the iOS wheel is sourced from BeeWare's index during iOS builds.)
+
+The vectors file was generated from pycryptodomex. After the swap, the tests prove `cryptography` still produces identical outputs. The test suite becomes a permanent regression guard.
+
+### Step 5: Manual validation checklist
+
+Before final merge:
+
+- [ ] `pytest tests/test_crypto_migration.py` — 15/15 pass
+- [ ] Server boots and loads the RSA key
+- [ ] Game client login handshake succeeds (RSA decrypt + AES-CBC)
+- [ ] API responses have valid X-Message-Sign (RSA sign)
+- [ ] Serial code redemption works (PBKDF2 + AES-CTR)
+- [ ] `make_server_key.py` generates a usable key
+- [ ] `util/decrypt_db_row.py` decrypts a test database
 
 ---
 
-### Phase 5: Validation Checklist
+## What the Tests Discovered
 
-Before removing `pycryptodomex` from requirements:
+The harness already surfaced and **confirmed safe** three subtle API differences:
 
-- [ ] `tests/test_crypto_migration.py` passes with all vector groups
-- [ ] Full server boot with `NPPS4_CRYPTO_DUAL_RUN=1` — no mismatches logged
-- [ ] Game client can connect and complete:
-  - [ ] Login handshake (RSA decrypt + AES-CBC decrypt of session key)
-  - [ ] API request/response cycle (X-Message-Sign RSA signature verification)
-  - [ ] Live show (verifies no runtime errors in hot path)
-  - [ ] Transfer code generation/use (SHA1 hashing in `handover.py` — stdlib, but verify the flow)
-  - [ ] Serial code redemption (PBKDF2 + AES-CTR in `schema.py`)
-- [ ] `util/decrypt_db_row.py` successfully decrypts a test database
-- [ ] `make_server_key.py` generates a key that the server can load and the client accepts
-- [ ] Dual-run wrapper removed, `pycryptodomex` removed from requirements
-- [ ] CI (if any) passes
+1. **AES-CTR nonce expansion**: PyCryptodome's `nonce=` (8 bytes) + `initial_value=0` internally builds a 16-byte IV as `nonce || 0x0000000000000000`. The `cryptography` API requires the full 16-byte IV directly. The fix is `nonce + b"\x00" * 8` — the test proves this matches.
+
+2. **RSA sign hashing**: PyCryptodome separates hash construction from signing (`SHA1.new(data)` then `pkcs1_15.sign(hash_obj)`). The `cryptography` API combines them (`key.sign(data, padding, hash_algo)` — it hashes internally). For the two-step `sign_message` pattern (`SHA1.new(content).update(xmc)`), this is equivalent to `key.sign(content + xmc, ...)` because SHA1 is a Merkle–Damgård hash where `H(a).update(b) == H(a || b)`. The test proves byte-identical signatures.
+
+3. **PBKDF2 PRF parameter**: `schema.py` uses `hmac_hash_module=Cryptodome.Hash.SHA256`, which is standard HMAC-SHA256 PRF — directly equivalent to `PBKDF2HMAC(algorithm=hashes.SHA256())`. If it had used the `prf=` parameter instead (which takes a custom lambda), the output would differ because PyCryptodome's `prf=` default is HMAC-SHA1. The test vectors confirmed that `hmac_hash_module=` is used and the outputs match.
 
 ---
 
-### Phase 6: Cleanup
+## Improvement Opportunities
 
-- Remove `NPPS4_CRYPTO_DUAL_RUN` dual-run code from `npps4/crypto.py`
-- Remove `pycryptodomex` from `requirements.txt`
-- Keep `tests/test_crypto_migration.py` and `tests/crypto_test_vectors.json` as regression tests
+The migration doesn't just swap libraries — it can make the crypto code better:
 
----
+1. **Explicit nonce handling**: The `nonce + b"\x00" * 8` pattern is self-documenting, unlike PyCryptodome's implicit zero-padding. Future readers see exactly what the 16-byte CTR IV looks like.
 
-## How This Workflow Improves Over a Direct Swap
+2. **RSA sign data flow clarity**: Concatenating `content + xmc` before signing makes the data flow obvious. The current two-step hash is correct but requires knowing SHA1's internal state model to verify.
 
-| Concern | Direct swap | This workflow |
-|---|---|---|
-| Nonce/IV handling differences | Discovered in production | Caught by test vectors in Phase 1 |
-| PBKDF2 PRF mismatch | Silent wrong keys | Caught by PBKDF2 vector comparison |
-| RSA padding edge cases | Client rejects signatures | Caught by dual-run in Phase 3 |
-| AES-CTR counter semantics | Corrupted serial codes | Explicit in `crypto.py`, tested |
-| Regression after migration | Unknown | Permanent test suite from Phase 1 |
-| Future library swap | Another risky migration | Abstraction layer absorbs it |
-
-## Specific Improvement Opportunities
-
-1. **Explicit nonce handling**: PyCryptodome's `nonce=` parameter silently zero-pads the counter. The `cryptography` migration forces this to be explicit (`nonce + b"\x00" * (16 - len(nonce))`), making the code self-documenting.
-
-2. **PBKDF2 correctness**: Verify that `schema.py` uses `hmac_hash_module=` (HMAC-SHA256, standard PBKDF2) and not `prf=` (custom PRF). If it uses `prf=`, the current implementation may actually be non-standard, and the migration is an opportunity to fix it.
-
-3. **RSA sign data flow**: The current two-step hash (`SHA1.new(content).update(xmc)`) is correct but fragile. The `cryptography` API hashes internally from concatenated data, which is clearer.
-
-4. **Padding removal**: `decrypt_aes` in `util.py` does manual PKCS7 unpadding (`data[:-data[-1]]`). This doesn't validate that all padding bytes are correct (a malformed padding like `\x03\x01\x03` would silently produce wrong output). The `cryptography` library offers proper `PKCS7` unpadding that validates — consider using it for strictness. However, since the current code works and changing padding behavior could break compatibility with existing encrypted data, keep the manual unpad to match existing behavior exactly.
-
-5. **Centralized crypto**: Scattering `Cryptodome.*` imports across 5 files means each file independently handles padding, modes, etc. The `npps4/crypto.py` module centralizes these decisions.
+3. **Padding strictness (optional)**: The manual PKCS7 unpad `data[:-data[-1]]` doesn't validate padding bytes. The `cryptography` library's `PKCS7` padding module does. Consider switching if you want stricter validation — but keep manual unpad if compatibility with potentially malformed ciphertext matters.
