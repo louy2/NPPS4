@@ -199,6 +199,89 @@ Pydantic v1 (1.10.x) will not support Python 3.14+, which is NPPS4's target runt
 
 ---
 
+## How the iOS Client Patcher Works
+
+### The Two-Part Client Modification
+
+To connect to a private server, the SIF game client needs two modifications:
+
+1. **Server URL replacement** (in `server_info.json`)
+2. **RSA public key replacement** (in the game binary)
+
+These are independent operations serving different purposes.
+
+### Part 1: Server URL — `server_info.json`
+
+The game client ships with an encrypted `server_info.json` at `Payload/LoveLive.app/ProjectResources/config/server_info.json`. This file contains:
+
+```json
+{
+  "name": "server_information",
+  "domain": "https://prod-jp.lovelive.ge.klabgames.net",
+  "end_point": "/main.php",
+  "consumer_key": "lovelive_test",
+  "application_key": "b6e6c940a93af2357ea3e0ace0b98afc",
+  "api_uri": { ... }
+}
+```
+
+The [sif-patcher web tool](https://github.com/ethanaobrien/sif-patcher) works by:
+1. Loading the IPA (ZIP archive)
+2. Decrypting `server_info.json` using **libhonoka** (compiled to WebAssembly)
+3. String-replacing the official domain with the user's private server URL
+4. Re-encrypting the file with libhonoka
+5. Writing the modified file back into the IPA
+
+For localhost use (self-contained iOS), the domain would be `http://127.0.0.1:51376`.
+
+**NPPS4's server-side auto-fix**: When the `download.send_patched_server_info` config is enabled (default: `true`), the server dynamically generates a correct `server_info.json` during the download/update flow (`npps4/svinfo.py`). It uses `honkypy` (Python equivalent of libhonoka) to encrypt a `server_info.json` with all URLs pointing to the actual server address. This is delivered as a game update package, overriding whatever was baked into the IPA. **This means the initial `server_info.json` in the IPA just needs to point to the server once** — after the first download/update, the server replaces it with a correctly-configured version.
+
+### Part 2: RSA Public Key — Binary Patch
+
+Server responses include an `X-Message-Sign` header containing an RSA PKCS#1 v1.5 signature (1024-bit RSA, SHA-1). The client verifies this signature using a public key embedded in the native binary (`LoveLive` Mach-O executable on iOS).
+
+The [community-standard RSA key](https://github.com/DarkEnergyProcessor/NPPS4#using-provided-private-key) (used by NPPS4 by default, LLSIF@Home, and community-patched clients) has this public key:
+```
+MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDE0RNd6047aeBirzVb61DolatY
+YWpaEUIPugOIkobHDc9qVR5iliMLyC0ErXO1siLBwN+U3zaDVOa5uhXbiS7uYq5c
+cpxComxTnZtcn/b+mKDpYWLaC0Gv7UoiT8rpNqN3Vko645usz9OFc4VciijsHGRP
+XmmmoP6qykfI/vba8wIDAQAB
+```
+
+The sif-patcher **does not** modify the RSA key — it only changes the domain. The RSA key must be replaced separately by binary-patching the `LoveLive` Mach-O executable (finding the old public key bytes with `strings` and replacing them). Pre-patched community clients already have this done.
+
+### Can the Patcher Patch a Briefcase-Produced App?
+
+**No, and it doesn't need to.** The patcher modifies the *game client* (SIF), not the server app. The architecture is:
+
+```
+┌──────────────────────────┐     ┌──────────────────────────┐
+│  NPPS4 Server App (IPA)  │     │  Patched SIF Client (IPA)│
+│  Built with Briefcase    │     │  Patched with sif-patcher│
+│  Contains: Python server │     │  Contains: Game client   │
+│  Listens: 127.0.0.1:51376│◄────│  Connects to: 127.0.0.1 │
+└──────────────────────────┘     └──────────────────────────┘
+        Server IPA                       Client IPA
+   (produced by us)              (produced by sif-patcher)
+```
+
+These are **two separate IPAs** installed side-by-side via AltStore:
+- **Server IPA**: Built by Briefcase, embeds CPython + NPPS4. Not touched by sif-patcher
+- **Client IPA**: The original SIF game, patched by sif-patcher to point to `http://127.0.0.1:51376` and use the community RSA public key
+
+### iOS-Specific Concern: Cross-App Localhost
+
+On iOS, two separate apps **can** communicate over localhost (`127.0.0.1`). iOS does not sandbox loopback networking between apps — any app can connect to any port on `127.0.0.1`. This has been tested and confirmed by various iOS development communities.
+
+The workflow for the user would be:
+1. Install **NPPS4 Server** via AltStore
+2. Install **patched SIF** via AltStore (using sif-patcher with domain `http://127.0.0.1:51376`)
+3. Open NPPS4 Server app, tap "Start Server"
+4. Switch to SIF app, play normally
+5. Keep NPPS4 Server in the foreground (or use Split View on iPad) to prevent iOS from suspending it
+
+---
+
 ## Implementation Plan for Embedded Python Route
 
 ### Phase 1: Dependency Resolution (2-4 weeks)
