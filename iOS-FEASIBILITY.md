@@ -111,20 +111,22 @@ Every operation has a direct equivalent:
 
 **Status**: [No iOS wheels on PyPI](https://github.com/pydantic/pydantic-core/issues/1170). Issue #1170 remains open. The maintainer's position: "If rust/maturin/pyo3 can build for iOS, we would absolutely support it."
 
-**Since then**: Maturin v1.7.0+ supports iOS. BeeWare has successfully built other Rust-based iOS wheels (cryptography). The tooling is ready, but nobody has submitted a PR to pydantic-core's CI to add iOS wheel builds.
+**Since then**: Maturin v1.7.0+ supports iOS (with PEP 730-compliant wheel naming as of v1.10). BeeWare has successfully built other Rust-based iOS wheels (cryptography). The tooling is ready, but nobody has submitted a PR to pydantic-core's CI to add iOS wheel builds. There is [no pure-Python fallback for pydantic-core, and none is planned](https://github.com/pydantic/pydantic/discussions/10859).
 
 #### Option 2a: Cross-compile pydantic-core for iOS (Recommended)
 
 **Approach**:
 1. Clone pydantic-core
-2. Install maturin ≥1.7.0 and Rust with iOS targets (`aarch64-apple-ios`, `aarch64-apple-ios-sim`)
+2. Install maturin ≥1.10 and Rust with iOS targets (`aarch64-apple-ios`, `aarch64-apple-ios-sim`)
 3. Set up a cross-compilation venv using BeeWare's Python-Apple-support
-4. Run `maturin build --target aarch64-apple-ios`
-5. Use the resulting wheel in the Briefcase project
+4. Set `PYO3_CROSS=1` and `PYO3_CROSS_LIB_DIR` pointing to iOS-compiled libpython ([per PyO3 docs](https://github.com/PyO3/pyo3/discussions/4824))
+5. Run `maturin build --target aarch64-apple-ios`
+6. The resulting wheel should use PEP 730 tags: `ios_X_Y_arm64_iphoneos`
+7. Use the resulting wheel in the Briefcase project
 
-**Effort**: 1-3 weeks (mostly fighting build system edge cases). BeeWare's success with `cryptography` proves the maturin→iOS pipeline works. The pydantic-core build is more complex (larger codebase, more Rust dependencies) but uses the same toolchain.
+**Effort**: 2-3 weeks (mostly fighting build system edge cases). BeeWare's success with `cryptography` proves the maturin→iOS pipeline works. The pydantic-core build is more complex (larger codebase, more Rust dependencies) but uses the same toolchain.
 
-**Risk**: Medium. Maturin iOS support is still young. Build failures are likely and may require upstream patches to maturin or PyO3. However, BeeWare's team is actively supporting this use case and responsive to issues.
+**Risk**: Medium. Nobody has publicly reported a successful pydantic-core iOS cross-compilation. Build failures are likely and may require upstream patches to maturin or PyO3. However, BeeWare's team (notably @freakboy3742) is actively contributing iOS fixes to maturin and responsive to issues.
 
 #### Option 2b: Downgrade to Pydantic v1 (pure Python)
 
@@ -145,6 +147,10 @@ Every operation has a direct equivalent:
 **Risk**: Very high. pydantic-core's API is internal and undocumented. Pydantic updates would break the shim.
 
 **Verdict**: Not recommended.
+
+#### Note on Pydantic v1 Python version support
+
+Pydantic v1 (1.10.x) will not support Python 3.14+, which is NPPS4's target runtime per the README badge. This further argues against the Pydantic v1 downgrade path.
 
 ---
 
@@ -316,3 +322,5 @@ The pydantic-core cross-compilation is the only real unknown, but the tooling (m
 - [kivy-ios pycryptodome issue #755](https://github.com/kivy/kivy-ios/issues/755)
 - [PEP 730 — iOS platform tags](https://peps.python.org/pep-0730/)
 - [pyca/cryptography RSA docs](https://cryptography.io/en/latest/hazmat/primitives/asymmetric/rsa/)
+- [PyO3 iOS/Android cross-compilation discussion #4824](https://github.com/PyO3/pyo3/discussions/4824)
+- [Pydantic pure-Python fallback discussion #10859](https://github.com/pydantic/pydantic/discussions/10859)
