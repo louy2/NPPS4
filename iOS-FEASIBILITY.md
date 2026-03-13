@@ -27,7 +27,7 @@ The Android self-contained experience uses:
 
 ### CPython Official iOS Support (PEP 730)
 
-**iOS is an officially supported CPython platform since Python 3.13** (October 2024, [Tier 3](https://peps.python.org/pep-0730/)). This is a major enabler.
+**iOS is an officially supported CPython platform since Python 3.13** (October 2024, [Tier 3](https://peps.python.org/pep-0730/)). This is a major enabler. BeeWare's [Python-Apple-support](https://github.com/beeware/Python-Apple-support) provides **pre-built binaries of standard CPython** (3.10–3.14) as `Python.xcframework` bundles ready to embed in Xcode projects. [Briefcase](https://briefcase.beeware.org/) automates downloading these binaries, bundling your Python code, and generating the Xcode project. In short: we embed CPython 3.14, using BeeWare's tooling to build and package it.
 
 Key constraints of CPython on iOS:
 - Python runs in **embedded mode only** — `libPython` must be linked into a native iOS app; you call `Py_Initialize()` from Swift/ObjC
