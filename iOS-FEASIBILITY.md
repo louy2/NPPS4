@@ -279,64 +279,246 @@ SIF uses [**PlaygroundOSS**](https://github.com/KLab/PlaygroundOSS), KLab's own 
 
 The technique injects a dynamic library into the game's Mach-O binary so it loads **before the game's `main()` runs**:
 
-1. **Build a bootstrap dylib** containing:
-   - `Python.xcframework` initialization (`Py_Initialize()`)
+1. **Build a bootstrap dylib** as an iOS framework (`.framework` bundle — standalone `.dylib` files are [rejected on iOS](https://developer.apple.com/library/archive/technotes/tn2435/_index.html)):
+   - `Python.xcframework` initialization via the `PyConfig` API ([PEP 587](https://peps.python.org/pep-0587/))
    - NPPS4 server startup code (equivalent to `android_main.py`)
-   - A C function with `__attribute__((constructor))` — this runs automatically when the dylib is loaded into memory, before the app's `main()` is called
+   - A C function with `__attribute__((constructor))` — this runs automatically when the framework is loaded, before the app's `main()` is called
 
-2. **Inject the dylib** into the SIF binary using [**optool**](https://github.com/alexzielenski/optool):
+2. **Inject the framework** into the SIF binary using [**optool**](https://github.com/alexzielenski/optool):
    ```bash
    optool install -c load \
      -p "@executable_path/Frameworks/NPPSBootstrap.framework/NPPSBootstrap" \
      -t "Payload/LoveLive.app/LoveLive"
    ```
-   This adds an `LC_LOAD_DYLIB` load command to the Mach-O header, telling iOS to load our framework when the app launches.
+   This adds an `LC_LOAD_DYLIB` load command to the Mach-O header, telling iOS to load our framework when the app launches. The `@executable_path/Frameworks/` path works because the SIF binary already has an `LC_RPATH` pointing there (standard for iOS apps). Verify with `otool -l LoveLive | grep -A2 LC_RPATH`.
 
 3. **Bundle everything** into the IPA's `Frameworks/` directory:
    - `NPPSBootstrap.framework` — the bootstrap dylib
    - `Python.framework` — CPython runtime (from BeeWare's Python-Apple-support)
-   - All Python dependency frameworks (cryptography, pydantic-core, etc.)
+   - All Python dependency frameworks (cryptography, pydantic-core, etc. — each `.so` must be converted to a signed `.framework`, see below)
    - NPPS4 source code and data files (in a resource bundle)
 
-4. **Re-sign** the entire IPA (all frameworks must be individually signed)
+4. **Re-sign** the entire IPA — every `.framework` must be individually signed
 
-#### Bootstrap Sequence
+#### Constructor Load Order
 
-```c
+When the app launches, dyld processes load commands in order ([Apple Dynamic Library Design Guidelines](https://developer.apple.com/library/archive/documentation/DeveloperTools/Conceptual/DynamicLibraries/100-Articles/DynamicLibraryDesignGuidelines.html)):
+
+```
+Game's original dependencies (UIKit, OpenGLES, etc.)
+→ Game's own static constructors (C++ globals, ObjC +load methods)
+→ Python.framework constructors (NPPSBootstrap depends on it)
+→ NPPSBootstrap's __attribute__((constructor))
+→ main()
+→ application:didFinishLaunchingWithOptions:  ← game's first network I/O is much later
+```
+
+Since `optool` appends our `LC_LOAD_DYLIB`, NPPSBootstrap loads after all original game dependencies. Our constructor runs after the game's own constructors but before `main()`. The game doesn't make network requests until well after `main()`, during `application:didFinishLaunchingWithOptions:` and the subsequent splash/title/download screens — giving the server seconds to initialize.
+
+#### Bootstrap Sequence (Corrected)
+
+The bootstrap must use the modern `PyConfig` API (not the deprecated `Py_Initialize()` + `setenv`), and must correctly release the GIL before dispatching work to a background thread:
+
+```objc
 // NPPSBootstrap.m
 #import <Python/Python.h>
+#import <dispatch/dispatch.h>
+
+// Saved thread state for potential future main-thread Python calls
+static PyThreadState *g_mainThreadState = NULL;
 
 __attribute__((constructor))
 static void npps4_bootstrap(void) {
-    // 1. Set up Python home to point to bundled stdlib
     NSBundle *bundle = [NSBundle mainBundle];
-    NSString *pythonHome = [bundle.resourcePath stringByAppendingPathComponent:@"python"];
-    setenv("PYTHONHOME", pythonHome.UTF8String, 1);
+    NSString *resourcePath = bundle.resourcePath;
 
-    // 2. Initialize Python interpreter
-    Py_Initialize();
+    // ── Step 1: Pre-initialize (UTF-8 mode, required on iOS) ──
+    PyPreConfig preconfig;
+    PyPreConfig_InitIsolatedConfig(&preconfig);
+    preconfig.utf8_mode = 1;
 
-    // 3. Start NPPS4 server on background thread
-    //    (must not block — game's main() needs to run next)
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+    PyStatus status = Py_PreInitialize(&preconfig);
+    if (PyStatus_Exception(status)) {
+        NSLog(@"NPPS4: Python pre-init failed: %s", status.err_msg);
+        return;  // Don't crash the game — just skip server startup
+    }
+
+    // ── Step 2: Configure Python for iOS embedded mode ──
+    PyConfig config;
+    PyConfig_InitIsolatedConfig(&config);
+
+    // iOS-mandatory settings (per CPython iOS docs):
+    config.buffered_stdio = 0;      // iOS has no terminal stdio
+    config.write_bytecode = 0;      // Bundle is read-only
+    config.install_signal_handlers = 1;
+#if PY_VERSION_HEX >= 0x030D0000  // Python 3.13+
+    config.use_system_logger = 1;   // Route prints to os_log
+#endif
+
+    // Set Python home → bundled stdlib
+    NSString *pythonHome = [resourcePath stringByAppendingPathComponent:@"python"];
+    status = PyConfig_SetBytesString(&config, &config.home,
+                                     pythonHome.UTF8String);
+    if (PyStatus_Exception(status)) goto fail;
+
+    // Set module search paths explicitly
+    config.module_search_paths_set = 1;
+
+    NSString *paths[] = {
+        [NSString stringWithFormat:@"%@/python/lib/python3.14", resourcePath],
+        [NSString stringWithFormat:@"%@/python/lib/python3.14/lib-dynload", resourcePath],
+        [NSString stringWithFormat:@"%@/app", resourcePath],  // NPPS4 source
+        [NSString stringWithFormat:@"%@/app_packages", resourcePath],  // pip dependencies
+    };
+    for (int i = 0; i < sizeof(paths)/sizeof(paths[0]); i++) {
+        wchar_t *wpath = Py_DecodeLocale(paths[i].UTF8String, NULL);
+        PyWideStringList_Append(&config.module_search_paths, wpath);
+        PyMem_RawFree(wpath);
+    }
+
+    // ── Step 3: Initialize Python ──
+    status = Py_InitializeFromConfig(&config);
+    PyConfig_Clear(&config);
+
+    if (PyStatus_Exception(status)) {
+        NSLog(@"NPPS4: Python init failed: %s", status.err_msg);
+        return;
+    }
+
+    // ── Step 4: Release the GIL ──
+    // CRITICAL: After Py_Initialize, the calling thread holds the GIL.
+    // We MUST release it before dispatch_async's thread can acquire it.
+    // Without this, PyGILState_Ensure() in the block below DEADLOCKS.
+    g_mainThreadState = PyEval_SaveThread();
+
+    // ── Step 5: Start NPPS4 server on a background thread ──
+    // dispatch_async returns immediately — game's main() runs next.
+    NSString *documentsDir = NSSearchPathForDirectoriesInDomains(
+        NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         PyGILState_STATE gstate = PyGILState_Ensure();
-        PyRun_SimpleString(
+
+        // Set NPPS4 data directory to iOS Documents/ (writable, persists across updates)
+        PyObject *code = PyUnicode_FromFormat(
+            "import os\n"
+            "os.environ['NPPS4_DATA_DIR'] = '%s'\n"
             "import ios_main\n"
             "ios_main.setup_server()\n"
-            "ios_main.start_server('127.0.0.1', 51376)\n"
+            "ios_main.start_server('127.0.0.1', 51376)\n",
+            documentsDir.UTF8String
         );
+        PyObject *mainmod = PyImport_AddModule("__main__");
+        PyObject *globals = PyModule_GetDict(mainmod);
+        PyObject *result = PyRun_String(
+            PyUnicode_AsUTF8(code), Py_file_input, globals, globals);
+
+        if (result == NULL) {
+            PyErr_Print();  // Log error but don't crash
+        }
+        Py_XDECREF(result);
+        Py_DECREF(code);
+
         PyGILState_Release(gstate);
     });
 
-    // 4. Return — game's main() runs, game initializes and connects to 127.0.0.1:51376
+    // ── Step 6: Return — game's main() runs ──
+    return;
+
+fail:
+    PyConfig_Clear(&config);
+    NSLog(@"NPPS4: Python config failed: %s", status.err_msg);
 }
 ```
 
-Key details:
-- `__attribute__((constructor))` fires before `main()`, giving the server time to bind its port
-- Server startup is dispatched to a background thread so it doesn't block the game's initialization
-- The game's network stack takes a moment to initialize, giving the server enough time to be ready
-- If a race condition occurs, the game retries connections (standard behavior for network errors)
+**Key correctness details:**
+
+| Detail | Why it matters |
+|---|---|
+| `PyPreConfig.utf8_mode = 1` | iOS has no locale; UTF-8 mode avoids encoding errors |
+| `PyConfig.buffered_stdio = 0` | No terminal on iOS; buffered stdio causes hangs |
+| `PyConfig.write_bytecode = 0` | App bundle is read-only; `.pyc` writes would fail |
+| `config.module_search_paths_set = 1` | Tells Python we provide paths explicitly (don't auto-discover) |
+| `PyEval_SaveThread()` before `dispatch_async` | **Without this, the background thread deadlocks** — it calls `PyGILState_Ensure()` which waits for the GIL that the main thread never released |
+| `QOS_CLASS_USER_INITIATED` | Higher priority than `DEFAULT`; server initialization is time-sensitive |
+| Error handling with `return` (not `exit()`) | If Python fails, the game still launches — just without the server |
+| Documents directory for data | Only writable persistent location on iOS; survives app updates |
+
+#### Building NPPSBootstrap.framework
+
+**Xcode project setup** — Create an iOS Framework target:
+
+| Build Setting | Value | Why |
+|---|---|---|
+| `ARCHS` | `arm64` | Device only (SIF is arm64) |
+| `IPHONEOS_DEPLOYMENT_TARGET` | `14.0` | Floor for TrollStore 14.0+, AltStore, BeeWare 13.0+ |
+| `DYLIB_INSTALL_NAME_BASE` | `@rpath` | Default; install name becomes `@rpath/NPPSBootstrap.framework/NPPSBootstrap` |
+| `LD_RUNPATH_SEARCH_PATHS` | `@executable_path/Frameworks @loader_path/Frameworks` | Finds Python.framework at runtime in the same Frameworks/ dir |
+| `MACH_O_TYPE` | `mh_dylib` | Default for framework targets |
+
+**Link against Python.xcframework**: Add to "Link Binary With Libraries" in Build Phases, but do **not** embed it (it goes into the IPA separately). NPPSBootstrap records a dependency on `@rpath/Python.framework/Python`, which dyld resolves via `@executable_path/Frameworks/Python.framework/Python` at runtime.
+
+**Verify the built framework:**
+```bash
+# Check install name
+otool -D NPPSBootstrap.framework/NPPSBootstrap
+# → @rpath/NPPSBootstrap.framework/NPPSBootstrap
+
+# Check it links against Python
+otool -L NPPSBootstrap.framework/NPPSBootstrap
+# → @rpath/Python.framework/Python
+
+# Check rpaths
+otool -l NPPSBootstrap.framework/NPPSBootstrap | grep -A2 LC_RPATH
+# → @executable_path/Frameworks, @loader_path/Frameworks
+```
+
+#### Binary Module Conversion (`.so` → `.framework`)
+
+iOS does not allow standalone `.so` or `.dylib` files in the app bundle ([TN2435](https://developer.apple.com/library/archive/technotes/tn2435/_index.html)). Every Python C extension must be converted to a signed `.framework` bundle. CPython 3.13+ on iOS includes `AppleFrameworkLoader` which reads `.fwork` marker files to redirect imports.
+
+BeeWare's `build_utils.sh` (bundled inside `Python.xcframework`) automates this via the `install_python` function. To use it in the Xcode build phase:
+
+```bash
+set -e
+source $PROJECT_DIR/Python.xcframework/build/build_utils.sh
+install_python Python.xcframework app app_packages
+```
+
+**The conversion for each module** (e.g., `_pydantic_core.cpython-314-darwin.so`):
+
+```
+1. Create:  Frameworks/_pydantic_core.framework/
+2. Move:    .so binary → Frameworks/_pydantic_core.framework/_pydantic_core
+3. Create:  Frameworks/_pydantic_core.framework/Info.plist
+4. Marker:  lib/python3.14/lib-dynload/_pydantic_core.cpython-314-darwin.fwork
+            Contents: "Frameworks/_pydantic_core/_pydantic_core"
+5. Origin:  Frameworks/_pydantic_core.framework/_pydantic_core.origin
+            Contents: path back to .fwork file
+6. Sign:    codesign --force --sign <identity> Frameworks/_pydantic_core.framework
+```
+
+For nested modules (e.g., `cryptography.hazmat.bindings._rust`), the framework name uses dots to flatten the path: `cryptography.hazmat.bindings._rust.framework`.
+
+For the **merged-IPA patcher workflow** (building outside Xcode), this conversion logic must be replicated in the patcher tool. It's ~50 lines of shell/Python.
+
+#### Code Signing
+
+Every binary in the IPA must be signed with the same identity:
+
+| Distribution method | Signing tool | Notes |
+|---|---|---|
+| **TrollStore** | `ldid -S` | Ad-hoc signing; TrollStore re-signs on install via CoreTrust bypass |
+| **AltStore** | Automatic | AltStore re-signs everything with the user's Apple ID |
+| **Sideloadly** | Automatic | Similar to AltStore |
+| **macOS build** | `codesign -fs "identity"` | For development/testing with an Apple developer certificate |
+
+```bash
+# Practical signing for TrollStore distribution:
+find Payload/LoveLive.app/Frameworks -name "*.framework" -exec \
+  sh -c 'ldid -S "$1/$(basename "$1" .framework)"' _ {} \;
+ldid -S Payload/LoveLive.app/LoveLive
+```
 
 #### Extended Patcher Workflow
 
@@ -344,25 +526,30 @@ The sif-patcher tool would be extended to perform these additional steps:
 
 ```
 Input: Community-patched SIF IPA (RSA key already replaced)
-       + Python.framework (pre-built from BeeWare)
-       + NPPS4 source bundle
+       + Python.xcframework (pre-built from BeeWare)
+       + NPPSBootstrap.framework (pre-built from Xcode)
+       + NPPS4 source bundle (pre-compiled .pyc)
        + Pre-compiled iOS wheels (pydantic-core, cryptography, etc.)
 
 Steps:
-1. Unzip IPA
-2. Replace server_info.json domain → http://127.0.0.1:51376 (existing)
-3. Copy Python.framework → Payload/LoveLive.app/Frameworks/
-4. Copy NPPSBootstrap.framework → Payload/LoveLive.app/Frameworks/
-5. Copy dependency .frameworks → Payload/LoveLive.app/Frameworks/
-6. Copy NPPS4 source + data → Payload/LoveLive.app/npps4/
-7. Inject LC_LOAD_DYLIB via optool → LoveLive binary
-8. Re-sign all frameworks and the main binary
-9. Re-zip as IPA
+ 1. Unzip IPA
+ 2. Replace server_info.json domain → http://127.0.0.1:51376 (existing patcher)
+ 3. Copy Python.framework → Payload/LoveLive.app/Frameworks/
+ 4. Copy NPPSBootstrap.framework → Payload/LoveLive.app/Frameworks/
+ 5. Run .so → .framework conversion for all binary Python modules
+ 6. Copy converted dependency .frameworks → Payload/LoveLive.app/Frameworks/
+ 7. Create .fwork marker files at original module paths
+ 8. Copy NPPS4 source + data → Payload/LoveLive.app/app/
+ 9. Copy pip dependencies → Payload/LoveLive.app/app_packages/
+10. Copy Python stdlib → Payload/LoveLive.app/python/
+11. Inject LC_LOAD_DYLIB via optool → LoveLive binary
+12. Re-sign all frameworks and the main binary (ldid or codesign)
+13. Re-zip as IPA
 
 Output: Single IPA with game client + embedded NPPS4 server
 ```
 
-This could be a **command-line tool** (macOS/Linux, since code signing requires `codesign` or `ldid`) or an extension to the existing web-based sif-patcher (though binary manipulation in WASM is more complex).
+This could be a **command-line Python tool** (using `optool` as a subprocess) or integrated into the existing web-based sif-patcher (optool logic is just Mach-O header editing — a pure-JS/WASM reimplementation is feasible).
 
 #### Advantages Over Two-IPA Approach
 
@@ -400,26 +587,29 @@ This could be a **command-line tool** (macOS/Linux, since code signing requires 
 ### Phase 2: Bootstrap Dylib & Server Integration (3-4 weeks)
 
 3. **Create `ios_main.py`** (modeled on `android_main.py`) (~3 days)
-   - `setup_server()`, `start_server(host, port)`, `stop_server()`
-   - Add `sys.platform == "ios"` handling in config.py, requirements
+   - Must call `npps4.config.config._override_script_mode(False)` before other npps4 imports
+   - `setup_server()`: Run Alembic migrations + data migrations (same as `android_main.py`)
+   - `start_server(host, port)`: Create `uvicorn.Config` with `loop="npps4.evloop:new_event_loop"`, run `uvicorn.Server(cfg).run()` (blocks — called from background thread)
+   - `stop_server()`: Set `server_instance.should_exit = True` (cross-thread safe)
    - **Critical**: iOS forbids `fork()`/`spawn()` — the `android_main.py` pattern (in-process `uvicorn.Server.run()`) must be used
-   - Database path must point to the app's `Documents/` directory (writable on iOS)
-   - `evloop.py` already handles missing uvloop gracefully — no changes needed
+   - Database/data path: Use iOS `Documents/` directory via env var set by bootstrap
+   - `evloop.py` already handles missing uvloop gracefully — falls back to `asyncio.new_event_loop`
 
 4. **Build NPPSBootstrap.framework** (~2 weeks)
-   - Create Xcode framework project targeting iOS (arm64)
-   - Link against `Python.xcframework` from BeeWare's Python-Apple-support
-   - Implement `__attribute__((constructor))` bootstrap (see Bootstrap Sequence above)
-   - Handle Python GIL correctly — server runs on a background thread via `dispatch_async`
-   - Set up `PYTHONHOME` and `PYTHONPATH` to find bundled stdlib and NPPS4 source
-   - Handle edge cases: What if Python init fails? What if port is already in use?
+   - Create Xcode framework project: arm64, iOS 14.0+, linked against `Python.xcframework`
+   - Implement `__attribute__((constructor))` bootstrap using `PyConfig` API (see Bootstrap Sequence above)
+   - **GIL handling**: `Py_InitializeFromConfig()` → `PyEval_SaveThread()` → `dispatch_async` + `PyGILState_Ensure()`. The `SaveThread` call is critical — without it the background thread deadlocks
+   - Error handling: Log failures via `NSLog`, return without crashing the game
+   - Module search paths: `python/lib/python3.14`, `python/lib/python3.14/lib-dynload`, `app/` (NPPS4), `app_packages/` (pip deps)
+   - Verify with `otool -L` / `otool -D` that install name and rpaths are correct
    - Test on real device (simulator won't have the SIF client)
 
 5. **Convert Python dependencies to iOS frameworks** (~1 week)
-   - Each `.so` binary module must become a signed `.framework` bundle
-   - BeeWare's Briefcase has tooling for this conversion — extract and adapt it
-   - Required frameworks: `_cffi_backend`, `_rust` (cryptography internals), `_pydantic_core`
-   - Pure-Python packages (FastAPI, uvicorn, starlette, etc.) go in a resource bundle as-is
+   - Use BeeWare's `build_utils.sh` / `install_python` for `.so` → `.framework` conversion
+   - Each binary module becomes a signed `.framework` with an `.fwork` marker file (CPython's `AppleFrameworkLoader` reads these)
+   - Required frameworks: `_cffi_backend`, `cryptography.hazmat.bindings._rust`, `_pydantic_core`
+   - Pure-Python packages (FastAPI, uvicorn, starlette, pydantic, etc.) go as-is in `app_packages/`
+   - Prune unused stdlib modules (test, tkinter, idlelib, etc.) — saves ~20 MB
 
 ### Phase 3: Patcher Extension & Distribution (2-3 weeks)
 
@@ -474,9 +664,22 @@ This could be a **command-line tool** (macOS/Linux, since code signing requires 
 
 ### Nice-to-Have Changes
 
-5. **Reduced import time** — Python initialization happens in the constructor before `main()`. Lazy imports help reduce the delay before the game starts.
-6. **Memory budget** — iOS gives ~300-500MB to foreground apps on modern devices. SIF uses ~100-150MB, NPPS4 uses ~50-100MB. Combined ~200-250MB with comfortable headroom.
-7. **Startup race condition mitigation** — Add a small `usleep()` after dispatching the server thread, or have the bootstrap set an environment variable/file that the patched `server_info.json` domain check could wait on. In practice, the game's own initialization (loading assets, showing splash screen) takes several seconds, giving the server plenty of time to bind.
+5. **Reduced import time** — `Py_InitializeFromConfig()` takes ~200-500ms. Module imports (NPPS4 + deps) take ~1-3s but run on the background thread so they don't block the game. Pre-compiling all `.py` to `.pyc` saves ~30% import time. Lazy imports help further.
+6. **Memory budget** — Estimated runtime memory:
+
+   | Component | RSS Estimate |
+   |---|---|
+   | CPython interpreter (initialized) | ~15-25 MB |
+   | Stdlib + NPPS4 + deps (FastAPI, uvicorn, pydantic) | ~40-75 MB |
+   | SQLite database (in-memory cache) | ~5-20 MB |
+   | **Total Python overhead** | **~60-120 MB** |
+   | SIF game (existing) | ~100-150 MB |
+   | **Combined** | **~160-270 MB** |
+
+   Modern iOS devices give foreground apps 300-500 MB (iPhone 8+) to 1-2 GB (iPhone 12+). Combined footprint stays well within budget.
+
+7. **IPA size impact** — Python.framework adds ~100 MB uncompressed (~30-40 MB in IPA's ZIP). Stdlib can be pruned by ~20 MB (remove test, tkinter, idlelib, etc.). NPPSBootstrap.framework itself is <100 KB. Total IPA size increase: ~50-70 MB compressed.
+8. **Startup race condition mitigation** — Server needs ~2-4 seconds from app launch to be ready. SIF's own startup takes 5-10 seconds (splash screen → title screen → data download check). In practice, the game won't make its first network request until well after the server is listening. If needed, add a `usleep()` in the constructor or a retry loop in `ios_main.py`.
 
 ---
 
@@ -485,7 +688,7 @@ This could be a **command-line tool** (macOS/Linux, since code signing requires 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
 | pydantic-core fails to cross-compile for iOS | Medium | **Blocks project** | Fall back to Pydantic v1 (Option 2b), or contribute the fix upstream to maturin/PyO3 |
-| Python initialization too slow (delays game start) | Medium | Poor UX | Lazy imports, pre-compiled `.pyc` files, move init to background thread |
+| Python initialization too slow (delays game start) | Low-Medium | Poor UX | `Py_InitializeFromConfig` is ~200-500ms (before `main()`); imports run on background thread. Pre-compile `.pyc`, prune stdlib |
 | Bootstrap race condition (game connects before server ready) | Low-Medium | Game shows network error | Game retries on network error; add `usleep()` delay; game splash screen provides natural buffer |
 | Memory pressure (game + Python runtime) | Low | Crashes | NPPS4 is lightweight (~50-100MB); combined with SIF (~100-150MB) stays within iOS budget |
 | `optool` injection breaks code signing | Low | Build fails | Well-tested technique in iOS tweak community; `ldid`/`codesign` re-sign handles this |
@@ -512,7 +715,7 @@ This could be a **command-line tool** (macOS/Linux, since code signing requires 
 │  │  ┌──────────▼─────────────────────────┐        │  │
 │  │  │ NPPSBootstrap.framework            │        │  │
 │  │  │  __attribute__((constructor))       │        │  │
-│  │  │  → Py_Initialize()                 │        │  │
+│  │  │  → Py_InitializeFromConfig()       │        │  │
 │  │  │  → dispatch_async: start_server()  │        │  │
 │  │  └──────────┬─────────────────────────┘        │  │
 │  │             │                                  │  │
@@ -588,12 +791,19 @@ The critical path is:
 - [kivy-ios pycryptodome issue #701](https://github.com/kivy/kivy-ios/issues/701)
 - [kivy-ios pycryptodome issue #755](https://github.com/kivy/kivy-ios/issues/755)
 
-### iOS Dylib Injection
+### iOS Dylib Injection & Code Signing
 - [optool — Mach-O binary manipulation](https://github.com/alexzielenski/optool)
 - [iOS Dylib Injection Demo (with patchapp.sh)](https://github.com/depoon/iOSDylibInjectionDemo)
 - [How to perform iOS Code Injection on .ipa files](https://medium.com/@kennethpoon/how-to-perform-ios-code-injection-on-ipa-files-1ba91d9438db)
 - [ios-dylib-inject — Script for dylib injection + re-signing](https://github.com/gnithin/ios-dylib-inject)
 - [iPA-Edit — Cross-platform IPA modification tool](https://github.com/SHAJON-404/iPA-Edit)
+- [Apple TN2435 — Embedding Frameworks In An App](https://developer.apple.com/library/archive/technotes/tn2435/_index.html)
+- [Apple Dynamic Library Design Guidelines (constructor load order)](https://developer.apple.com/library/archive/documentation/DeveloperTools/Conceptual/DynamicLibraries/100-Articles/DynamicLibraryDesignGuidelines.html)
+- [Understanding @executable_path, @loader_path and @rpath](https://itwenty.me/posts/01-understanding-rpath/)
+
+### Python Embedding
+- [PEP 587 — Python Initialization Configuration (PyConfig API)](https://peps.python.org/pep-0587/)
+- [CPython Android testbed — mobile embedding reference](https://github.com/python/cpython/tree/main/Android/testbed)
 
 ### SIF Game Engine
 - [PlaygroundOSS — KLab's open-source game engine (official repo)](https://github.com/KLab/PlaygroundOSS)
