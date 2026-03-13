@@ -18,39 +18,19 @@ import urllib.parse
 
 from typing import Any
 
-try:
-    import Cryptodome.Cipher.AES  # type: ignore
+import cryptography.hazmat.primitives.ciphers
+import cryptography.hazmat.primitives.ciphers.algorithms
+import cryptography.hazmat.primitives.ciphers.modes
 
-    def decrypt_aes(key: bytes, data: bytes) -> bytes:
-        aes_obj = Cryptodome.Cipher.AES.new(key, Cryptodome.Cipher.AES.MODE_CBC, iv=data[:16])
-        data = aes_obj.decrypt(data[16:])
-        return data[: -data[-1]]
 
-except ImportError:
-    try:
-        import Crypto.Cipher.AES  # type: ignore
-
-        def decrypt_aes(key: bytes, data: bytes) -> bytes:
-            aes_obj = Crypto.Cipher.AES.new(key, Crypto.Cipher.AES.MODE_CBC, iv=data[:16])
-            data = aes_obj.decrypt(data[16:])
-            return data[: -data[-1]]
-
-    except ImportError:
-        try:
-            import cryptography.hazmat.primitives.ciphers  # type: ignore
-            import cryptography.hazmat.primitives.ciphers.algorithms  # type: ignore
-            import cryptography.hazmat.primitives.ciphers.modes  # type: ignore
-
-            def decrypt_aes(key: bytes, data: bytes) -> bytes:
-                aes_obj = cryptography.hazmat.primitives.ciphers.algorithms.AES(key)
-                cbc_obj = cryptography.hazmat.primitives.ciphers.modes.CBC(data[:16])
-                cipher = cryptography.hazmat.primitives.ciphers.Cipher(aes_obj, cbc_obj)
-                decrypter = cipher.decryptor()
-                decrypted_data = decrypter.update(data[16:]) + decrypter.finalize()
-                return decrypted_data[: -decrypted_data[-1]]
-
-        except ImportError:
-            raise Exception("no PyCryptodomex nor cryptography module")
+def decrypt_aes(key: bytes, data: bytes) -> bytes:
+    cipher = cryptography.hazmat.primitives.ciphers.Cipher(
+        cryptography.hazmat.primitives.ciphers.algorithms.AES(key),
+        cryptography.hazmat.primitives.ciphers.modes.CBC(data[:16]),
+    )
+    decryptor = cipher.decryptor()
+    decrypted_data = decryptor.update(data[16:]) + decryptor.finalize()
+    return decrypted_data[: -decrypted_data[-1]]
 
 
 def make_path(parse_result: urllib.parse.ParseResult):

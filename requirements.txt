@@ -5,7 +5,7 @@ honkypy @ https://github.com/DarkEnergyProcessor/honky-py/releases/download/0.2.
 httpx
 itsdangerous
 jinja2
-pycryptodomex
+cryptography
 pydantic>=2
 pydantic-settings
 python-multipart

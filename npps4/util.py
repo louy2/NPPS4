@@ -9,11 +9,11 @@ import random
 import time as timelib
 import urllib.parse
 
-import Cryptodome.Cipher.PKCS1_v1_5
-import Cryptodome.Cipher.AES
-import Cryptodome.Hash.SHA1
-import Cryptodome.Util.Padding
-import Cryptodome.Signature.pkcs1_15
+import cryptography.hazmat.primitives.asymmetric.padding
+import cryptography.hazmat.primitives.ciphers
+import cryptography.hazmat.primitives.ciphers.algorithms
+import cryptography.hazmat.primitives.ciphers.modes
+import cryptography.hazmat.primitives.hashes
 import pydantic
 
 from .config import config
@@ -38,22 +38,22 @@ def sif_version_string(version: tuple[int, int]):
 
 
 def sign_message(content: bytes, request_xmc_hex: str | None):
-    sha1 = Cryptodome.Hash.SHA1.new(content)
+    data = content
     if request_xmc_hex is not None:
-        sha1.update(request_xmc_hex.encode("UTF-8"))
-    sign = Cryptodome.Signature.pkcs1_15.new(config.get_server_rsa())
-    return str(base64.b64encode(sign.sign(sha1)), "UTF-8")
+        data = content + request_xmc_hex.encode("UTF-8")
+    sig = config.get_server_rsa().sign(data, cryptography.hazmat.primitives.asymmetric.padding.PKCS1v15(), cryptography.hazmat.primitives.hashes.SHA1())
+    return str(base64.b64encode(sig), "UTF-8")
 
 
 def decrypt_rsa(data: bytes):
-    pkcs = Cryptodome.Cipher.PKCS1_v1_5.new(config.get_server_rsa())
-    return pkcs.decrypt(data, None)
+    return config.get_server_rsa().decrypt(data, cryptography.hazmat.primitives.asymmetric.padding.PKCS1v15())
 
 
 def decrypt_aes(key: bytes, data: bytes):
-    aes = Cryptodome.Cipher.AES.new(key, Cryptodome.Cipher.AES.MODE_CBC, iv=data[:16])
-    data = aes.decrypt(data[16:])
-    return data[: -data[-1]]
+    cipher = cryptography.hazmat.primitives.ciphers.Cipher(cryptography.hazmat.primitives.ciphers.algorithms.AES(key), cryptography.hazmat.primitives.ciphers.modes.CBC(data[:16]))
+    decryptor = cipher.decryptor()
+    padded = decryptor.update(data[16:]) + decryptor.finalize()
+    return padded[: -padded[-1]]
 
 
 def xorbytes(a: bytes, b: bytes):
