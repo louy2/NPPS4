@@ -1,13 +1,20 @@
-# iOS Self-Contained Experience: Feasibility Analysis (Embedded Python Route)
+# iOS Self-Contained Experience: Feasibility Analysis
 
 ## Executive Summary
 
-Providing a self-contained NPPS4 experience on iOS via AltStore is **feasible but requires meaningful dependency work**. The recommended path is BeeWare Briefcase with Python-Apple-support. The two binary dependencies (`pycryptodomex` and `pydantic-core`) are the critical blockers, but both have viable solutions:
+Providing a self-contained NPPS4 experience on iOS via AltStore is **feasible using a merged single-IPA architecture** — the NPPS4 Python server is injected directly into the patched SIF game client, running in-process alongside the game. This solves the critical iOS limitation where background apps are killed after ~30 seconds.
 
+The approach uses:
+- **BeeWare's Python-Apple-support** to embed CPython as a framework in the game IPA
+- **Dylib injection** (`optool` + `__attribute__((constructor))`) to bootstrap the Python server before the game's `main()` runs
+- **`cryptography` (pyca)** replacing `pycryptodomex` (iOS wheels already available)
+- **Cross-compiled `pydantic-core`** via maturin's iOS support
+
+The two binary dependencies are the critical blockers, but both have viable solutions:
 - **`pycryptodomex`**: Replace with `cryptography` (pyca), which already has [iOS wheels built by BeeWare](https://beeware.org/news/buzz/november-2025-status-update/). All crypto operations used by NPPS4 have direct equivalents.
-- **`pydantic-core`**: [Maturin gained iOS support in v1.7.0](https://github.com/PyO3/maturin/releases/tag/v1.7.0), but [pydantic-core has not yet published iOS wheels](https://github.com/pydantic/pydantic-core/issues/1170). The wheel must be built from source using maturin's iOS cross-compilation, which is now technically possible but untested for pydantic-core specifically.
+- **`pydantic-core`**: [Maturin gained iOS support in v1.7.0](https://github.com/PyO3/maturin/releases/tag/v1.7.0), but [pydantic-core has not yet published iOS wheels](https://github.com/pydantic/pydantic-core/issues/1170). The wheel must be built from source using maturin's iOS cross-compilation.
 
-**Revised effort estimate: 2-4 person-months** for the embedded Python approach targeting AltStore distribution.
+**Effort estimate: 2-3 person-months** for the merged single-IPA approach targeting AltStore distribution.
 
 ---
 
@@ -250,39 +257,124 @@ XmmmoP6qykfI/vba8wIDAQAB
 
 The sif-patcher **does not** modify the RSA key — it only changes the domain. The RSA key replacement is a separate binary-level modification to the `LoveLive` Mach-O executable. In practice, the community distributes **pre-patched client builds** (e.g., via Internet Archive) that already have the community-standard RSA key baked in. The sif-patcher web tool expects these pre-patched builds as input — it then only needs to swap the domain. So for end users, the workflow is: get the community-patched IPA → run it through sif-patcher with `http://127.0.0.1:51376` → sideload via AltStore.
 
-### Can the Patcher Patch a Briefcase-Produced App?
+### Why Not Two Separate IPAs?
 
-**No, and it doesn't need to.** The patcher modifies the *game client* (SIF), not the server app. The architecture is:
+The obvious approach — a separate server IPA and client IPA communicating over localhost — **fails on iOS** due to background execution limits. iOS suspends background apps after ~30 seconds. When the user switches from the server app to the game client, the server gets suspended and the game can't reach it. Split View on iPad is a workaround but not viable on iPhone and is a poor UX.
+
+### Solution: Merged Single-IPA Architecture
+
+**Merge the NPPS4 server directly into the patched game client IPA.** The server runs in-process alongside the game, solving the background execution problem entirely — when the game is in the foreground, so is the server.
+
+#### SIF Game Engine: Playground OSS
+
+SIF uses [**Playground OSS**](https://github.com/nickyma/playground-win), KLab's custom open-source C/C++ game engine. This is relevant because:
+- It's **not Unity** — no IL2CPP/Mono complications when injecting native code
+- The engine is native C/C++ — a dylib injection via `LC_LOAD_DYLIB` is straightforward
+- The [SIF Win32 port](https://github.com/stlcours/SIF_Win32) confirms this engine structure
+
+#### How Dylib Injection Works
+
+The technique injects a dynamic library into the game's Mach-O binary so it loads **before the game's `main()` runs**:
+
+1. **Build a bootstrap dylib** containing:
+   - `Python.xcframework` initialization (`Py_Initialize()`)
+   - NPPS4 server startup code (equivalent to `android_main.py`)
+   - A C function with `__attribute__((constructor))` — this runs automatically when the dylib is loaded into memory, before the app's `main()` is called
+
+2. **Inject the dylib** into the SIF binary using [**optool**](https://github.com/alexzielenski/optool):
+   ```bash
+   optool install -c load \
+     -p "@executable_path/Frameworks/NPPSBootstrap.framework/NPPSBootstrap" \
+     -t "Payload/LoveLive.app/LoveLive"
+   ```
+   This adds an `LC_LOAD_DYLIB` load command to the Mach-O header, telling iOS to load our framework when the app launches.
+
+3. **Bundle everything** into the IPA's `Frameworks/` directory:
+   - `NPPSBootstrap.framework` — the bootstrap dylib
+   - `Python.framework` — CPython runtime (from BeeWare's Python-Apple-support)
+   - All Python dependency frameworks (cryptography, pydantic-core, etc.)
+   - NPPS4 source code and data files (in a resource bundle)
+
+4. **Re-sign** the entire IPA (all frameworks must be individually signed)
+
+#### Bootstrap Sequence
+
+```c
+// NPPSBootstrap.m
+#import <Python/Python.h>
+
+__attribute__((constructor))
+static void npps4_bootstrap(void) {
+    // 1. Set up Python home to point to bundled stdlib
+    NSBundle *bundle = [NSBundle mainBundle];
+    NSString *pythonHome = [bundle.resourcePath stringByAppendingPathComponent:@"python"];
+    setenv("PYTHONHOME", pythonHome.UTF8String, 1);
+
+    // 2. Initialize Python interpreter
+    Py_Initialize();
+
+    // 3. Start NPPS4 server on background thread
+    //    (must not block — game's main() needs to run next)
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        PyGILState_STATE gstate = PyGILState_Ensure();
+        PyRun_SimpleString(
+            "import ios_main\n"
+            "ios_main.setup_server()\n"
+            "ios_main.start_server('127.0.0.1', 51376)\n"
+        );
+        PyGILState_Release(gstate);
+    });
+
+    // 4. Return — game's main() runs, game initializes and connects to 127.0.0.1:51376
+}
+```
+
+Key details:
+- `__attribute__((constructor))` fires before `main()`, giving the server time to bind its port
+- Server startup is dispatched to a background thread so it doesn't block the game's initialization
+- The game's network stack takes a moment to initialize, giving the server enough time to be ready
+- If a race condition occurs, the game retries connections (standard behavior for network errors)
+
+#### Extended Patcher Workflow
+
+The sif-patcher tool would be extended to perform these additional steps:
 
 ```
-┌──────────────────────────┐     ┌──────────────────────────┐
-│  NPPS4 Server App (IPA)  │     │  Patched SIF Client (IPA)│
-│  Built with Briefcase    │     │  Patched with sif-patcher│
-│  Contains: Python server │     │  Contains: Game client   │
-│  Listens: 127.0.0.1:51376│◄────│  Connects to: 127.0.0.1 │
-└──────────────────────────┘     └──────────────────────────┘
-        Server IPA                       Client IPA
-   (produced by us)              (produced by sif-patcher)
+Input: Community-patched SIF IPA (RSA key already replaced)
+       + Python.framework (pre-built from BeeWare)
+       + NPPS4 source bundle
+       + Pre-compiled iOS wheels (pydantic-core, cryptography, etc.)
+
+Steps:
+1. Unzip IPA
+2. Replace server_info.json domain → http://127.0.0.1:51376 (existing)
+3. Copy Python.framework → Payload/LoveLive.app/Frameworks/
+4. Copy NPPSBootstrap.framework → Payload/LoveLive.app/Frameworks/
+5. Copy dependency .frameworks → Payload/LoveLive.app/Frameworks/
+6. Copy NPPS4 source + data → Payload/LoveLive.app/npps4/
+7. Inject LC_LOAD_DYLIB via optool → LoveLive binary
+8. Re-sign all frameworks and the main binary
+9. Re-zip as IPA
+
+Output: Single IPA with game client + embedded NPPS4 server
 ```
 
-These are **two separate IPAs** installed side-by-side via AltStore:
-- **Server IPA**: Built by Briefcase, embeds CPython + NPPS4. Not touched by sif-patcher
-- **Client IPA**: The original SIF game, patched by sif-patcher to point to `http://127.0.0.1:51376` and use the community RSA public key
+This could be a **command-line tool** (macOS/Linux, since code signing requires `codesign` or `ldid`) or an extension to the existing web-based sif-patcher (though binary manipulation in WASM is more complex).
 
-### iOS-Specific Concern: Cross-App Localhost
+#### Advantages Over Two-IPA Approach
 
-On iOS, two separate apps **can** communicate over localhost (`127.0.0.1`). iOS does not sandbox loopback networking between apps — any app can connect to any port on `127.0.0.1`. This has been tested and confirmed by various iOS development communities.
-
-The workflow for the user would be:
-1. Install **NPPS4 Server** via AltStore
-2. Install **patched SIF** via AltStore (using sif-patcher with domain `http://127.0.0.1:51376`)
-3. Open NPPS4 Server app, tap "Start Server"
-4. Switch to SIF app, play normally
-5. Keep NPPS4 Server in the foreground (or use Split View on iPad) to prevent iOS from suspending it
+| | Two IPAs | Merged Single IPA |
+|---|---|---|
+| Background execution | Server suspended after ~30s | Server lives as long as game does |
+| User workflow | Start server → switch to game | Just launch the game |
+| AltStore app slots | Uses 2 of 3 free slots | Uses 1 slot |
+| Localhost networking | Works but fragile | In-process, guaranteed |
+| App size | ~100MB server + ~200MB game | ~300MB single app |
+| Complexity | Simpler build, harder UX | Harder build, seamless UX |
 
 ---
 
-## Implementation Plan for Embedded Python Route
+## Implementation Plan for Merged Single-IPA Route
 
 ### Phase 1: Dependency Resolution (2-4 weeks)
 
@@ -295,57 +387,55 @@ The workflow for the user would be:
 
 2. **Cross-compile pydantic-core for iOS** (~2-3 weeks)
    - Set up macOS build environment with Xcode, Rust toolchain, iOS SDK targets
-   - Install maturin ≥1.7.0
+   - Install maturin ≥1.10
    - Create BeeWare Python-Apple-support cross-compilation venv
-   - Build pydantic-core wheel targeting `aarch64-apple-ios` and `aarch64-apple-ios-sim`
-   - Test the wheel in a minimal Briefcase iOS app
+   - Build pydantic-core wheel targeting `aarch64-apple-ios`
+   - Set `PYO3_CROSS=1` and `PYO3_CROSS_LIB_DIR` pointing to iOS-compiled libpython
+   - Convert resulting `.so` to signed `.framework` bundle
+   - Test the wheel in a minimal test harness on-device
 
-### Phase 2: iOS App Shell (3-5 weeks)
+### Phase 2: Bootstrap Dylib & Server Integration (3-4 weeks)
 
-3. **Create Briefcase project** (~1 week)
-   - Initialize Briefcase iOS project
-   - Configure `pyproject.toml` with all NPPS4 dependencies
-   - Include NPPS4 source, alembic configs, game data
-   - Add custom iOS wheels to project (pydantic-core, any others)
+3. **Create `ios_main.py`** (modeled on `android_main.py`) (~3 days)
+   - `setup_server()`, `start_server(host, port)`, `stop_server()`
+   - Add `sys.platform == "ios"` handling in config.py, requirements
+   - **Critical**: iOS forbids `fork()`/`spawn()` — the `android_main.py` pattern (in-process `uvicorn.Server.run()`) must be used
+   - Database path must point to the app's `Documents/` directory (writable on iOS)
+   - `evloop.py` already handles missing uvloop gracefully — no changes needed
 
-4. **Implement iOS `main.py` (similar to `android_main.py`)** (~1 week)
-   - Port the `android_main.py` lifecycle API to iOS
-   - `setup_server()`, `start_server()`, `stop_server()`
-   - Database import/export
-   - Add `sys.platform == "ios"` handling in config.py, evloop.py, requirements
-   - **Critical**: iOS forbids `fork()`/`spawn()` — `subprocess` and `multiprocessing` raise `PermissionError`. The `android_main.py` pattern already avoids this (runs uvicorn in-process via `uvicorn.Server.run()`), so the same approach works. The `main.py` entrypoint (which uses `subprocess.call` for alembic/gunicorn) must NOT be used on iOS
+4. **Build NPPSBootstrap.framework** (~2 weeks)
+   - Create Xcode framework project targeting iOS (arm64)
+   - Link against `Python.xcframework` from BeeWare's Python-Apple-support
+   - Implement `__attribute__((constructor))` bootstrap (see Bootstrap Sequence above)
+   - Handle Python GIL correctly — server runs on a background thread via `dispatch_async`
+   - Set up `PYTHONHOME` and `PYTHONPATH` to find bundled stdlib and NPPS4 source
+   - Handle edge cases: What if Python init fails? What if port is already in use?
+   - Test on real device (simulator won't have the SIF client)
 
-5. **Build native iOS UI** (~2-3 weeks)
-   - Swift/SwiftUI wrapper app with:
-     - Server start/stop controls
-     - Status indicator (server running/stopped)
-     - Server URL display (for manual client configuration)
-     - Database management (import/export/reset)
-     - Configuration editor (server settings)
-   - Integrate with Python via [PythonKit](https://github.com/pvieito/PythonKit) (Pythonic Swift API) or direct C-level embedding (`Py_Initialize()` / `PyRun_SimpleString()`)
+5. **Convert Python dependencies to iOS frameworks** (~1 week)
+   - Each `.so` binary module must become a signed `.framework` bundle
+   - BeeWare's Briefcase has tooling for this conversion — extract and adapt it
+   - Required frameworks: `_cffi_backend`, `_rust` (cryptography internals), `_pydantic_core`
+   - Pure-Python packages (FastAPI, uvicorn, starlette, etc.) go in a resource bundle as-is
 
-### Phase 3: Client Integration & Distribution (2-3 weeks)
+### Phase 3: Patcher Extension & Distribution (2-3 weeks)
 
-6. **Game client connectivity** (~1 week)
-   - Test patched iOS client connecting to embedded server on localhost
-   - Handle the "two apps" problem:
-     - Option A: Use a URL scheme to launch the game client from the server app
-     - Option B: Provide clear instructions for configuring the patched client
-   - Verify game functionality end-to-end
+6. **Extend sif-patcher or build new CLI patcher** (~2 weeks)
+   - Implement the Extended Patcher Workflow (see above)
+   - Input: community-patched SIF IPA + pre-built server components
+   - Operations: inject `LC_LOAD_DYLIB`, copy frameworks, copy Python source/data
+   - Use optool (or reimplement LC_LOAD_DYLIB injection — it's just Mach-O header editing)
+   - Re-sign with `ldid` (for TrollStore) or `codesign` (for AltStore with Apple ID)
+   - Output: single merged IPA
+   - Could be a Python CLI tool (ironic but practical) or integrated into the web patcher
 
-7. **AltStore/TrollStore packaging** (~1 week)
-   - `briefcase open iOS` → Xcode, configure signing, Archive → `.ipa`
-   - Create AltStore source JSON (see format above)
-   - Host `.ipa` and source JSON
-   - Test installation via AltStore
-   - Test on TrollStore (if available)
-   - Document the installation process
-
-8. **Testing & polish** (~1 week)
+7. **AltStore/TrollStore packaging & testing** (~1 week)
+   - Create AltStore source JSON for distribution
+   - Test installation via AltStore Classic, AltStore PAL (EU), and TrollStore
    - Test on multiple iOS versions (15+)
-   - Test app suspension/resume behavior
-   - Test memory pressure handling
-   - Test database integrity under abrupt termination
+   - Test memory pressure handling (game + server sharing ~300-500MB budget)
+   - Test database integrity under app termination
+   - Verify end-to-end gameplay: launch game → server auto-starts → play normally
 
 ---
 
@@ -366,17 +456,24 @@ The workflow for the user would be:
    # setup_server(), start_server(), stop_server()
    # import_database(), export_database(), nuke_database()
    ```
+   Key differences from `android_main.py`:
+   - Database path: Use iOS `Documents/` directory (writable, persists across updates)
+   - No UI integration needed — server starts automatically via constructor bootstrap
+   - `start_server()` called from background thread (GIL-safe via `PyGILState_Ensure`)
+   - Server lifecycle tied to the game's process lifecycle (no separate stop needed)
 
-4. **Background handling** — iOS kills apps ~30 seconds after backgrounding:
-   - Use `BGTaskScheduler` for brief background execution
-   - Checkpoint database (SQLite WAL flush) on `applicationWillResignActive`
-   - Fast resume on `applicationDidBecomeActive`
-   - Accept that the server stops when the app is backgrounded (same UX as game itself)
+4. **Background/foreground handling** — In the merged architecture, the server's lifecycle matches the game's:
+   - When the game is foregrounded, the server runs
+   - When the game is backgrounded, both the game and server are suspended together (~30s)
+   - When the game is terminated, the server process dies with it
+   - SQLite WAL checkpoint on `applicationWillResignActive` (handled via ObjC notification observer in the bootstrap dylib)
+   - On next launch, the constructor fires again, reinitializing Python and the server
 
 ### Nice-to-Have Changes
 
-5. **Reduced import time** — Briefcase apps load all Python at startup. Lazy imports help.
-6. **Memory budget** — iOS gives ~300-500MB to foreground apps on modern devices. NPPS4 uses ~50-100MB. Comfortable headroom.
+5. **Reduced import time** — Python initialization happens in the constructor before `main()`. Lazy imports help reduce the delay before the game starts.
+6. **Memory budget** — iOS gives ~300-500MB to foreground apps on modern devices. SIF uses ~100-150MB, NPPS4 uses ~50-100MB. Combined ~200-250MB with comfortable headroom.
+7. **Startup race condition mitigation** — Add a small `usleep()` after dispatching the server thread, or have the bootstrap set an environment variable/file that the patched `server_info.json` domain check could wait on. In practice, the game's own initialization (loading assets, showing splash screen) takes several seconds, giving the server plenty of time to bind.
 
 ---
 
@@ -385,79 +482,120 @@ The workflow for the user would be:
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
 | pydantic-core fails to cross-compile for iOS | Medium | **Blocks project** | Fall back to Pydantic v1 (Option 2b), or contribute the fix upstream to maturin/PyO3 |
-| BeeWare/Briefcase has iOS bugs | Medium | Delays | Active project, responsive maintainers, file issues |
-| Game client can't connect to localhost on iOS | Low | **Blocks project** | Standard iOS networking, well-tested by other apps |
-| App gets killed during gameplay | Low | Poor UX | Users must keep server app foregrounded (split-screen or app switching) |
+| Python initialization too slow (delays game start) | Medium | Poor UX | Lazy imports, pre-compiled `.pyc` files, move init to background thread |
+| Bootstrap race condition (game connects before server ready) | Low-Medium | Game shows network error | Game retries on network error; add `usleep()` delay; game splash screen provides natural buffer |
+| Memory pressure (game + Python runtime) | Low | Crashes | NPPS4 is lightweight (~50-100MB); combined with SIF (~100-150MB) stays within iOS budget |
+| `optool` injection breaks code signing | Low | Build fails | Well-tested technique in iOS tweak community; `ldid`/`codesign` re-sign handles this |
 | AltStore 7-day re-signing annoys users | Medium | Poor UX | Recommend TrollStore where available; AltStore PAL in EU |
-| Apple blocks embedded Python in sideloaded apps | Very Low | **Blocks project** | Not subject to App Store review; Apple doesn't police sideloaded app internals |
+| Apple restricts sideloaded apps with interpreters | Very Low | **Blocks project** | Not subject to App Store review; Apple doesn't police sideloaded app internals |
+| SIF game binary updates break injection | Very Low | Build fails | SIF is discontinued (shut down March 2023); binary is fixed and archived |
 
 ---
 
 ## Architecture Diagram
 
 ```
-┌─────────────────────────────────────────────┐
-│                iOS Device                    │
-│                                              │
-│  ┌─────────────────────────────────────────┐ │
-│  │    NPPS4 Server App (via AltStore)      │ │
-│  │                                         │ │
-│  │  ┌──────────────────┐  ┌─────────────┐ │ │
-│  │  │ Swift UI Shell   │  │ Python      │ │ │
-│  │  │ (Start/Stop/     │──│ Runtime     │ │ │
-│  │  │  Status/Config)  │  │ (BeeWare)   │ │ │
-│  │  └──────────────────┘  │             │ │ │
-│  │                        │ FastAPI     │ │ │
-│  │                        │ uvicorn     │ │ │
-│  │                        │ SQLite      │ │ │
-│  │                        │ 127.0.0.1   │ │ │
-│  │                        │ :51376      │ │ │
-│  │                        └─────────────┘ │ │
-│  └────────────────────────────┬────────────┘ │
-│                               │ localhost    │
-│  ┌────────────────────────────┴────────────┐ │
-│  │    Patched SIF Client (via AltStore)    │ │
-│  │    Points to 127.0.0.1:51376            │ │
-│  └─────────────────────────────────────────┘ │
-└──────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│                    iOS Device                         │
+│                                                      │
+│  ┌────────────────────────────────────────────────┐  │
+│  │     Merged SIF + NPPS4 IPA (via AltStore)      │  │
+│  │                                                │  │
+│  │  ┌────────────────────────────────────┐        │  │
+│  │  │ LoveLive (Mach-O binary)           │        │  │
+│  │  │ + LC_LOAD_DYLIB: NPPSBootstrap     │        │  │
+│  │  └──────────┬─────────────────────────┘        │  │
+│  │             │ loads before main()               │  │
+│  │  ┌──────────▼─────────────────────────┐        │  │
+│  │  │ NPPSBootstrap.framework            │        │  │
+│  │  │  __attribute__((constructor))       │        │  │
+│  │  │  → Py_Initialize()                 │        │  │
+│  │  │  → dispatch_async: start_server()  │        │  │
+│  │  └──────────┬─────────────────────────┘        │  │
+│  │             │                                  │  │
+│  │  ┌──────────▼──────────┐  ┌─────────────────┐ │  │
+│  │  │ Python.framework    │  │ SIF Game Engine  │ │  │
+│  │  │ (BeeWare CPython)   │  │ (Playground OSS) │ │  │
+│  │  │                     │  │                  │ │  │
+│  │  │ FastAPI + uvicorn   │  │ Connects to:     │ │  │
+│  │  │ NPPS4 server code   │  │ 127.0.0.1:51376  │ │  │
+│  │  │ SQLite database     │◄─│                  │ │  │
+│  │  │ 127.0.0.1:51376     │  │ (via patched     │ │  │
+│  │  │ (background thread) │  │  server_info)    │ │  │
+│  │  └─────────────────────┘  └─────────────────┘ │  │
+│  │                                                │  │
+│  │  Frameworks/                                   │  │
+│  │  ├── NPPSBootstrap.framework                   │  │
+│  │  ├── Python.framework                          │  │
+│  │  ├── _cffi_backend.framework                   │  │
+│  │  ├── _pydantic_core.framework                  │  │
+│  │  └── ... (other binary modules)                │  │
+│  └────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## Recommendation
 
-**The embedded Python route via BeeWare Briefcase is viable and recommended for AltStore distribution.**
+**The merged single-IPA approach — injecting the NPPS4 Python server into the patched SIF game client — is the recommended architecture for iOS.**
+
+It solves the fatal flaw of the two-IPA approach (iOS background execution limits) and provides a seamless user experience: launch the game, play. No separate server app, no app switching, no split-screen workarounds.
 
 The critical path is:
 1. Replace `pycryptodomex` → `cryptography` (pyca) — **low risk, 2 days**
 2. Cross-compile `pydantic-core` for iOS via maturin — **medium risk, 2-3 weeks**
-3. Build the Briefcase iOS app shell — **low risk, 3-5 weeks**
-4. Package and test with AltStore — **low risk, 1-2 weeks**
+3. Build NPPSBootstrap.framework + `ios_main.py` — **medium risk, 2 weeks**
+4. Build/extend patcher tool for IPA injection — **medium risk, 2 weeks**
+5. Testing & distribution — **low risk, 1 week**
 
-**Total: 2-3 months** with the crypto library swap making the biggest single dependency (pycryptodomex) a non-issue.
+**Total: 2-3 months.** The approach builds on well-established iOS tweak injection techniques and BeeWare's proven iOS Python toolchain. The pydantic-core cross-compilation remains the single biggest risk, with the bootstrap dylib development being the main new work compared to the (abandoned) two-IPA approach.
 
-The pydantic-core cross-compilation is the only real unknown, but the tooling (maturin iOS support, BeeWare's success with the `cryptography` package) strongly suggests it's achievable. If it proves impossible, falling back to Pydantic v1 is ugly but workable.
+### User Workflow (End Result)
+
+1. Download pre-built merged IPA (or run the patcher tool themselves)
+2. Install via AltStore / TrollStore
+3. Launch the game
+4. Play — server is already running in-process
 
 ---
 
 ## References
 
+### Python on iOS
 - [BeeWare Python-Apple-support](https://github.com/beeware/Python-Apple-support)
 - [BeeWare Briefcase iOS docs](https://briefcase.beeware.org/en/v0.3.16/reference/platforms/iOS.html)
 - [BeeWare mobile wheels leaderboard](https://beeware.org/mobile-wheels/)
 - [BeeWare November 2025 update (cryptography iOS wheels)](https://beeware.org/news/buzz/november-2025-status-update/)
+- [PEP 730 — iOS platform tags](https://peps.python.org/pep-0730/)
+- [CPython iOS usage docs](https://docs.python.org/3/using/ios.html)
+- [Python-Apple-support USAGE.md](https://github.com/beeware/Python-Apple-support/blob/main/USAGE.md)
+- [Python-Apple-support static linking requirement #56](https://github.com/beeware/Python-Apple-support/issues/56)
+- [Pyto — Python IDE on App Store (proof of concept)](https://github.com/ColdGrub1384/Pyto)
+
+### Rust/PyO3 iOS Cross-Compilation
 - [Maturin iOS support (v1.7.0)](https://github.com/PyO3/maturin/releases/tag/v1.7.0)
 - [Maturin iOS issue #1742](https://github.com/PyO3/maturin/issues/1742)
+- [PyO3 iOS/Android cross-compilation discussion #4824](https://github.com/PyO3/pyo3/discussions/4824)
 - [pydantic-core iOS support issue #1170](https://github.com/pydantic/pydantic-core/issues/1170)
+- [Pydantic pure-Python fallback discussion #10859](https://github.com/pydantic/pydantic/discussions/10859)
+
+### Crypto Library Migration
+- [pyca/cryptography RSA docs](https://cryptography.io/en/latest/hazmat/primitives/asymmetric/rsa/)
 - [kivy-ios pycryptodome issue #701](https://github.com/kivy/kivy-ios/issues/701)
 - [kivy-ios pycryptodome issue #755](https://github.com/kivy/kivy-ios/issues/755)
-- [PEP 730 — iOS platform tags](https://peps.python.org/pep-0730/)
-- [pyca/cryptography RSA docs](https://cryptography.io/en/latest/hazmat/primitives/asymmetric/rsa/)
-- [PyO3 iOS/Android cross-compilation discussion #4824](https://github.com/PyO3/pyo3/discussions/4824)
-- [Pydantic pure-Python fallback discussion #10859](https://github.com/pydantic/pydantic/discussions/10859)
-- [Python-Apple-support static linking requirement #56](https://github.com/beeware/Python-Apple-support/issues/56)
-- [CPython iOS usage docs](https://docs.python.org/3/using/ios.html)
-- [Pyto — Python IDE on App Store (proof of concept)](https://github.com/ColdGrub1384/Pyto)
-- [PythonKit — Swift-Python bridge](https://github.com/pvieito/PythonKit)
+
+### iOS Dylib Injection
+- [optool — Mach-O binary manipulation](https://github.com/alexzielenski/optool)
+- [iOS Dylib Injection Demo (with patchapp.sh)](https://github.com/depoon/iOSDylibInjectionDemo)
+- [How to perform iOS Code Injection on .ipa files](https://medium.com/@kennethpoon/how-to-perform-ios-code-injection-on-ipa-files-1ba91d9438db)
+- [ios-dylib-inject — Script for dylib injection + re-signing](https://github.com/gnithin/ios-dylib-inject)
+- [iPA-Edit — Cross-platform IPA modification tool](https://github.com/SHAJON-404/iPA-Edit)
+
+### SIF Game Engine
+- [SIF Win32 port (confirms Playground OSS engine)](https://github.com/stlcours/SIF_Win32)
+- [Playground OSS — KLab's open-source game engine](https://github.com/nickyma/playground-win)
+
+### Distribution
 - [AltStore source format docs](https://faq.altstore.io/developers/make-a-source)
-- [Python-Apple-support USAGE.md](https://github.com/beeware/Python-Apple-support/blob/main/USAGE.md)
+- [PythonKit — Swift-Python bridge](https://github.com/pvieito/PythonKit)
