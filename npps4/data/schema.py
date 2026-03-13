@@ -1,9 +1,11 @@
 import base64
 import hashlib
 
-import Cryptodome.Cipher.AES
-import Cryptodome.Hash.SHA256
-import Cryptodome.Protocol.KDF
+import cryptography.hazmat.primitives.ciphers
+import cryptography.hazmat.primitives.ciphers.algorithms
+import cryptography.hazmat.primitives.ciphers.modes
+import cryptography.hazmat.primitives.hashes
+import cryptography.hazmat.primitives.kdf.pbkdf2
 import pydantic
 import pydantic.json_schema
 
@@ -135,22 +137,36 @@ SERIAL_CODE_ACTION_ADAPTER: pydantic.TypeAdapter[SerialCodeGiveItem | SerialCode
 
 
 def derive_serial_code_action_key(input_code: str, salt: bytes):
-    return Cryptodome.Protocol.KDF.PBKDF2(
-        cast(str, input_code.encode("utf-8")),
-        salt,
-        16,
-        4,
-        hmac_hash_module=Cryptodome.Hash.SHA256,
+    kdf = cryptography.hazmat.primitives.kdf.pbkdf2.PBKDF2HMAC(
+        algorithm=cryptography.hazmat.primitives.hashes.SHA256(),
+        length=16,
+        salt=salt,
+        iterations=4,
     )
+    return kdf.derive(input_code.encode("utf-8"))
+
+
+class _AesCtrCipher:
+    """Wrapper around cryptography's AES-CTR to provide encrypt/decrypt methods."""
+
+    def __init__(self, key: bytes, nonce: bytes):
+        self._cipher = cryptography.hazmat.primitives.ciphers.Cipher(
+            cryptography.hazmat.primitives.ciphers.algorithms.AES(key),
+            cryptography.hazmat.primitives.ciphers.modes.CTR(nonce),
+        )
+
+    def encrypt(self, data: bytes) -> bytes:
+        encryptor = self._cipher.encryptor()
+        return encryptor.update(data) + encryptor.finalize()
+
+    def decrypt(self, data: bytes) -> bytes:
+        decryptor = self._cipher.decryptor()
+        return decryptor.update(data) + decryptor.finalize()
 
 
 def initialize_aes_for_action_field(key: bytes, salt: bytes):
-    return Cryptodome.Cipher.AES.new(
-        key,
-        Cryptodome.Cipher.AES.MODE_CTR,
-        nonce=util.xorbytes(salt[:8], salt[8:]),
-        initial_value=0,
-    )
+    nonce = util.xorbytes(salt[:8], salt[8:]) + b"\x00" * 8
+    return _AesCtrCipher(key, nonce)
 
 
 class SerialCode(pydantic.BaseModel):

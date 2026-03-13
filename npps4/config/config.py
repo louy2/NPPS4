@@ -4,7 +4,7 @@ import runpy
 import sys
 import types
 
-import Cryptodome.PublicKey.RSA
+import cryptography.hazmat.primitives.serialization
 
 from . import cfgtype, data
 
@@ -33,7 +33,9 @@ try:
         if key_password == "":
             key_password = None
 
-        _SERVER_KEY = Cryptodome.PublicKey.RSA.import_key(f.read(), key_password)
+        _SERVER_KEY = cryptography.hazmat.primitives.serialization.load_pem_private_key(
+            f.read(), password=key_password.encode("utf-8") if key_password else None
+        )
 except IOError as e:
     raise Exception("Unable to load server private key. Double-check your configuration.") from e
 

@@ -1,7 +1,8 @@
 import os
 import sys
 
-import Cryptodome.PublicKey.RSA
+import cryptography.hazmat.primitives.asymmetric.rsa
+import cryptography.hazmat.primitives.serialization
 
 
 def ask_confirm(prompt: str):
@@ -16,13 +17,17 @@ def ask_confirm(prompt: str):
             print("Please type `y' or `n'!")
 
 
-def print_public_key(key: Cryptodome.PublicKey.RSA.RsaKey):
-    print(str(key.public_key().export_key("PEM"), "UTF-8"))
+def print_public_key(key: cryptography.hazmat.primitives.asymmetric.rsa.RSAPrivateKey):
+    pub_pem = key.public_key().public_bytes(
+        cryptography.hazmat.primitives.serialization.Encoding.PEM,
+        cryptography.hazmat.primitives.serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    print(str(pub_pem, "UTF-8"))
 
 
 if os.path.exists("server_key.pem"):
-    with open("server_key.pem", "r", encoding="UTF-8") as f:
-        key = Cryptodome.PublicKey.RSA.import_key(f.read())
+    with open("server_key.pem", "rb") as f:
+        key = cryptography.hazmat.primitives.serialization.load_pem_private_key(f.read(), password=None)
         print_public_key(key)
     if "-p" in sys.argv:
         raise SystemExit(0)
@@ -34,8 +39,14 @@ if os.path.exists("server_key.pem"):
         print("Key not overwritten")
         raise SystemExit(0)
 
-key = Cryptodome.PublicKey.RSA.generate(1024)
+key = cryptography.hazmat.primitives.asymmetric.rsa.generate_private_key(public_exponent=65537, key_size=1024)
 with open("server_key.pem", "wb") as f:
-    f.write(key.export_key("PEM"))
+    f.write(
+        key.private_bytes(
+            cryptography.hazmat.primitives.serialization.Encoding.PEM,
+            cryptography.hazmat.primitives.serialization.PrivateFormat.TraditionalOpenSSL,
+            cryptography.hazmat.primitives.serialization.NoEncryption(),
+        )
+    )
 
 print_public_key(key)
