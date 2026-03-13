@@ -11,8 +11,8 @@ npps4/config/config.py) to verify the as-written code produces correct results.
 
 import ast
 import base64
+import hashlib
 import os
-import textwrap
 import pytest
 
 # ---------------------------------------------------------------------------
@@ -32,12 +32,10 @@ import Cryptodome.Util.Padding
 # ---------------------------------------------------------------------------
 import cryptography.hazmat.primitives.asymmetric.padding
 import cryptography.hazmat.primitives.asymmetric.rsa
-import cryptography.hazmat.primitives.asymmetric.utils
 import cryptography.hazmat.primitives.ciphers
 import cryptography.hazmat.primitives.ciphers.algorithms
 import cryptography.hazmat.primitives.ciphers.modes
 import cryptography.hazmat.primitives.hashes
-import cryptography.hazmat.primitives.kdf.pbkdf2
 import cryptography.hazmat.primitives.serialization
 
 
@@ -80,6 +78,7 @@ def _extract_and_exec(filepath: str, names: list[str], extra_globals: dict | Non
 
     ns = {
         "base64": base64,
+        "hashlib": hashlib,
         "os": os,
         "cryptography": cryptography,
     }
@@ -218,17 +217,10 @@ class TestRSASignPKCS1v15SHA1:
         return signer.sign(sha1)
 
     def _sign_pyca(self, key, data):
-        digest = cryptography.hazmat.primitives.hashes.Hash(
-            cryptography.hazmat.primitives.hashes.SHA1()
-        )
-        digest.update(data)
-        hash_value = digest.finalize()
         return key.sign(
-            hash_value,
+            data,
             cryptography.hazmat.primitives.asymmetric.padding.PKCS1v15(),
-            cryptography.hazmat.primitives.asymmetric.utils.Prehashed(
-                cryptography.hazmat.primitives.hashes.SHA1()
-            ),
+            cryptography.hazmat.primitives.hashes.SHA1(),
         )
 
     def test_signatures_match(self, pycryptodome_rsa, pyca_rsa, message):
@@ -240,25 +232,17 @@ class TestRSASignPKCS1v15SHA1:
         """Mirrors sign_message when request_xmc_hex is not None."""
         content = b"request body content"
         xmc = "abc123def456"
+        data = content + xmc.encode("UTF-8")
 
-        # pycryptodome: incremental update
-        sha1 = Cryptodome.Hash.SHA1.new(content)
-        sha1.update(xmc.encode("UTF-8"))
+        # pycryptodome
+        sha1 = Cryptodome.Hash.SHA1.new(data)
         sig_old = Cryptodome.Signature.pkcs1_15.new(pycryptodome_rsa).sign(sha1)
 
-        # pyca: incremental update
-        digest = cryptography.hazmat.primitives.hashes.Hash(
-            cryptography.hazmat.primitives.hashes.SHA1()
-        )
-        digest.update(content)
-        digest.update(xmc.encode("UTF-8"))
-        hash_value = digest.finalize()
+        # pyca: pass concatenated data directly
         sig_new = pyca_rsa.sign(
-            hash_value,
+            data,
             cryptography.hazmat.primitives.asymmetric.padding.PKCS1v15(),
-            cryptography.hazmat.primitives.asymmetric.utils.Prehashed(
-                cryptography.hazmat.primitives.hashes.SHA1()
-            ),
+            cryptography.hazmat.primitives.hashes.SHA1(),
         )
 
         assert sig_old == sig_new
@@ -565,23 +549,19 @@ class TestPBKDF2:
             hmac_hash_module=Cryptodome.Hash.SHA256,
         )
 
-    def _derive_pyca(self, password, salt):
-        kdf = cryptography.hazmat.primitives.kdf.pbkdf2.PBKDF2HMAC(
-            algorithm=cryptography.hazmat.primitives.hashes.SHA256(),
-            length=16,
-            salt=salt,
-            iterations=4,
-        )
-        return kdf.derive(password.encode("utf-8"))
+    def _derive_hashlib(self, password, salt):
+        import hashlib
+        return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 4, dklen=16)
 
     def test_derived_keys_match(self, password_and_salt):
         password, salt = password_and_salt
         key_old = self._derive_pycryptodome(password, salt)
-        key_new = self._derive_pyca(password, salt)
+        key_new = self._derive_hashlib(password, salt)
         assert key_old == key_new
 
     def test_different_iterations_still_match(self):
         """Sanity check with higher iteration count."""
+        import hashlib
         password = "test"
         salt = os.urandom(16)
 
@@ -589,13 +569,7 @@ class TestPBKDF2:
             password.encode("utf-8"), salt, 32, 1000,
             hmac_hash_module=Cryptodome.Hash.SHA256,
         )
-        kdf = cryptography.hazmat.primitives.kdf.pbkdf2.PBKDF2HMAC(
-            algorithm=cryptography.hazmat.primitives.hashes.SHA256(),
-            length=32,
-            salt=salt,
-            iterations=1000,
-        )
-        key_new = kdf.derive(password.encode("utf-8"))
+        key_new = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 1000, dklen=32)
         assert key_old == key_new
 
 
@@ -653,12 +627,9 @@ class TestSerialCodeActionFlow:
             hmac_hash_module=Cryptodome.Hash.SHA256,
         )
 
-        # Derive key with pyca
-        kdf = cryptography.hazmat.primitives.kdf.pbkdf2.PBKDF2HMAC(
-            algorithm=cryptography.hazmat.primitives.hashes.SHA256(),
-            length=16, salt=salt, iterations=4,
-        )
-        key_new = kdf.derive(input_code.encode("utf-8"))
+        # Derive key with hashlib (new implementation)
+        import hashlib
+        key_new = hashlib.pbkdf2_hmac("sha256", input_code.encode("utf-8"), salt, 4, dklen=16)
 
         assert key_old == key_new
         key = key_old
@@ -710,17 +681,14 @@ class TestSHA1:
         return request.param
 
     def test_sha1_digest_matches(self, data):
+        import hashlib
         old = Cryptodome.Hash.SHA1.new(data).digest()
-
-        h = cryptography.hazmat.primitives.hashes.Hash(
-            cryptography.hazmat.primitives.hashes.SHA1()
-        )
-        h.update(data)
-        new = h.finalize()
+        new = hashlib.sha1(data).digest()
 
         assert old == new
 
     def test_sha1_incremental_update(self):
+        import hashlib
         part1 = b"hello "
         part2 = b"world"
 
@@ -728,12 +696,9 @@ class TestSHA1:
         old.update(part2)
         digest_old = old.digest()
 
-        h = cryptography.hazmat.primitives.hashes.Hash(
-            cryptography.hazmat.primitives.hashes.SHA1()
-        )
-        h.update(part1)
+        h = hashlib.sha1(part1)
         h.update(part2)
-        digest_new = h.finalize()
+        digest_new = h.digest()
 
         assert digest_old == digest_new
 
@@ -1088,17 +1053,10 @@ class TestNpps4MakeServerKey:
 
         # Sign with pyca (as util.py does), verify signature is valid
         data = b"test data to sign"
-        digest = cryptography.hazmat.primitives.hashes.Hash(
-            cryptography.hazmat.primitives.hashes.SHA1()
-        )
-        digest.update(data)
-        hash_value = digest.finalize()
         signature = pyca_key.sign(
-            hash_value,
+            data,
             cryptography.hazmat.primitives.asymmetric.padding.PKCS1v15(),
-            cryptography.hazmat.primitives.asymmetric.utils.Prehashed(
-                cryptography.hazmat.primitives.hashes.SHA1()
-            ),
+            cryptography.hazmat.primitives.hashes.SHA1(),
         )
 
         # Verify with pycryptodome (simulates a client verifying server signature)

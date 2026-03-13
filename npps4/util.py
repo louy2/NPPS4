@@ -10,7 +10,6 @@ import time as timelib
 import urllib.parse
 
 import cryptography.hazmat.primitives.asymmetric.padding
-import cryptography.hazmat.primitives.asymmetric.utils
 import cryptography.hazmat.primitives.ciphers
 import cryptography.hazmat.primitives.ciphers.algorithms
 import cryptography.hazmat.primitives.ciphers.modes
@@ -39,15 +38,11 @@ def sif_version_string(version: tuple[int, int]):
 
 
 def sign_message(content: bytes, request_xmc_hex: str | None):
-    digest = cryptography.hazmat.primitives.hashes.Hash(cryptography.hazmat.primitives.hashes.SHA1())
-    digest.update(content)
-    if request_xmc_hex is not None:
-        digest.update(request_xmc_hex.encode("UTF-8"))
-    hash_value = digest.finalize()
+    data = content if request_xmc_hex is None else content + request_xmc_hex.encode("UTF-8")
     signature = config.get_server_rsa().sign(
-        hash_value,
+        data,
         cryptography.hazmat.primitives.asymmetric.padding.PKCS1v15(),
-        cryptography.hazmat.primitives.asymmetric.utils.Prehashed(cryptography.hazmat.primitives.hashes.SHA1()),
+        cryptography.hazmat.primitives.hashes.SHA1(),
     )
     return str(base64.b64encode(signature), "UTF-8")
 

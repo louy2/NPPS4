@@ -4,8 +4,6 @@ import hashlib
 import cryptography.hazmat.primitives.ciphers
 import cryptography.hazmat.primitives.ciphers.algorithms
 import cryptography.hazmat.primitives.ciphers.modes
-import cryptography.hazmat.primitives.hashes
-import cryptography.hazmat.primitives.kdf.pbkdf2
 import pydantic
 import pydantic.json_schema
 
@@ -137,13 +135,7 @@ SERIAL_CODE_ACTION_ADAPTER: pydantic.TypeAdapter[SerialCodeGiveItem | SerialCode
 
 
 def derive_serial_code_action_key(input_code: str, salt: bytes):
-    kdf = cryptography.hazmat.primitives.kdf.pbkdf2.PBKDF2HMAC(
-        algorithm=cryptography.hazmat.primitives.hashes.SHA256(),
-        length=16,
-        salt=salt,
-        iterations=4,
-    )
-    return kdf.derive(input_code.encode("utf-8"))
+    return hashlib.pbkdf2_hmac("sha256", input_code.encode("utf-8"), salt, 4, dklen=16)
 
 
 class _AesCtrCipher:
