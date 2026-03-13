@@ -59,9 +59,9 @@ AltStore installs IPAs via sideloading. Key facts:
 
 ### 1. `pycryptodomex` → Replace with `cryptography` (pyca)
 
-**Status**: No iOS wheels exist for pycryptodomex. [No kivy-ios recipe](https://github.com/kivy/kivy-ios/issues/701). Cross-compilation has [known issues](https://github.com/kivy/kivy-ios/issues/755).
+**Status**: No iOS wheels exist for pycryptodomex. [No kivy-ios recipe](https://github.com/kivy/kivy-ios/issues/701). Cross-compilation has [known issues](https://github.com/kivy/kivy-ios/issues/755). Furthermore, iOS [does not allow dynamically loaded `.so` files](https://github.com/beeware/Python-Apple-support/issues/56) — C extensions must be compiled as static libraries (`.a`) and linked into the app binary, making a naive cross-compile insufficient.
 
-**Solution**: Replace with [`cryptography`](https://cryptography.io/) (pyca), which **already has iOS wheels** built by BeeWare. This is also a more actively maintained library.
+**Solution**: Replace with [`cryptography`](https://cryptography.io/) (pyca), which **already has iOS wheels** built by BeeWare (with the static linking problem solved). This is also a more actively maintained library.
 
 #### NPPS4 Crypto Operations Inventory
 
@@ -324,3 +324,4 @@ The pydantic-core cross-compilation is the only real unknown, but the tooling (m
 - [pyca/cryptography RSA docs](https://cryptography.io/en/latest/hazmat/primitives/asymmetric/rsa/)
 - [PyO3 iOS/Android cross-compilation discussion #4824](https://github.com/PyO3/pyo3/discussions/4824)
 - [Pydantic pure-Python fallback discussion #10859](https://github.com/pydantic/pydantic/discussions/10859)
+- [Python-Apple-support static linking requirement #56](https://github.com/beeware/Python-Apple-support/issues/56)
